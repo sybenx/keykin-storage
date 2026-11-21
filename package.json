@@ -1,0 +1,24 @@
+{
+  "name": "keykin-storage",
+  "version": "0.1.0",
+  "description": "A Blossom server and keeper for your Keykin box: your account and friends you add, nothing deleted behind your back.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node src/main.ts",
+    "accounts": "node src/cli.ts",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "@scure/base": "2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3"
+  }
+}
