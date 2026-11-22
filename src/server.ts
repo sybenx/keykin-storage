@@ -1,4 +1,5 @@
 // The Blossom server: BUD-01 (get), 02 (upload), 04 (mirror), 06 (upload preflight), 11 (auth), 12 (list, delete).
+// And the management surface, POST /manage (manage.ts).
 // Writes come only from keys of accounts on this box. Reads are open. Nothing is deleted on a timer except blobs
 // that sat in the bin (owned by nobody) for binDays.
 
@@ -11,6 +12,7 @@ import type { Config } from './config.ts';
 import { Db, type Account, type Blob, type Pending } from './db.ts';
 import { Home, httpHome, type HomeSource } from './home.ts';
 import { clientAddress, RateLimit } from './limit.ts';
+import { isManagePath, manager, send } from './manage.ts';
 import { guardedFetch, MirrorError } from './mirror.ts';
 import { serviceKey, type ServiceKey } from './servicekey.ts';
 import { Aborted, Store, TooLarge, TooSlow, type MinRate, type Received } from './store.ts';
@@ -147,6 +149,7 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
   };
 
   const limit = new RateLimit({ burst: config.authBurst ?? 60, perSecond: config.authPerSecond ?? 10 });
+  const manage = manager({ config, db, home, key, ready, now, removeFile: (s) => store.remove(s) });
 
   const timer = setInterval(sweep, 3600_000);
   timer.unref();
@@ -163,8 +166,11 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
     }
     if (method === 'OPTIONS') return end(res, 204);
     if (req.headers.authorization !== undefined && !limit.take(clientAddress(req, config.behindCloudflare))) {
-      return fail(res, 429, 'too many signed requests from your address; wait a few seconds', method === 'HEAD');
+      const why = 'too many signed requests from your address; wait a few seconds';
+      if (isManagePath(path)) return send(res, 429, { error: why }, method === 'HEAD');
+      return fail(res, 429, why, method === 'HEAD');
     }
+    if (isManagePath(path)) return manage.handle(req, res, path); // answers `info` even before the box is set up
     if (!ready && method !== 'GET' && method !== 'HEAD') {
       return fail(res, 503, 'this box is not set up yet: set STORAGE_PUBLIC_URL and STORAGE_OWNER');
     }
@@ -462,7 +468,7 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
 function cors(res: http.ServerResponse): void {
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-headers', 'Authorization, *');
-  res.setHeader('access-control-allow-methods', 'GET, HEAD, PUT, DELETE');
+  res.setHeader('access-control-allow-methods', 'GET, HEAD, PUT, DELETE, POST');
   res.setHeader('access-control-expose-headers', '*');
   res.setHeader('access-control-max-age', '86400');
 }
