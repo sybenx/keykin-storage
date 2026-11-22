@@ -300,6 +300,8 @@ export async function start(config: Config): Promise<Running> {
 
   async function mirror(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const { auth, account } = writer(req, 'upload');
+    // a mirror makes this box fetch a url someone else chose, from the box's home address: the owner's call only
+    if (account.pubkey !== config.owner) throw new HttpError(403, 'mirror is only for the owner of this box; upload instead');
     if (auth.xs.length === 0) throw new HttpError(401, 'mirror authorization needs an x tag');
     let url: unknown;
     try {

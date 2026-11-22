@@ -231,3 +231,30 @@ describe('4. take-down: erase now, purge an account, short cache lifetime', () =
     assert.equal(b.run.db.uploadedAt(sha(shared), friend.pk), null);
   });
 });
+
+describe('5. /mirror is for the owner only', () => {
+  let b: Box;
+  before(async () => { b = await box({ mirrorAllowPrivate: true }); });
+  after(() => b.close());
+
+  it('refuses a friend with 403 and says why, before fetching anything', async () => {
+    const friend = key();
+    b.run.db.putAccount(friend.pk, null, b.clock.now);
+    let fetched = 0;
+    const http = await import('node:http');
+    const src = http.createServer((_q, s) => { fetched++; s.end('x'); });
+    await new Promise<void>((r) => src.listen(0, '127.0.0.1', r));
+    try {
+      const url = `http://127.0.0.1:${(src.address() as { port: number }).port}/x`;
+      const r = await fetch(`${b.url}/mirror`, { method: 'PUT', body: JSON.stringify({ url }), headers: { authorization: auth(friend, { t: 'upload', x: [sha('x')], now: b.clock.now }) } });
+      assert.equal(r.status, 403);
+      assert.match(r.headers.get('x-reason')!, /owner/);
+      assert.equal(fetched, 0);
+      const o = await fetch(`${b.url}/mirror`, { method: 'PUT', body: JSON.stringify({ url }), headers: { authorization: auth(b.owner, { t: 'upload', x: [sha('x')], now: b.clock.now }) } });
+      assert.equal(o.status, 201);
+    } finally {
+      src.closeAllConnections();
+      await new Promise((r) => src.close(r));
+    }
+  });
+});

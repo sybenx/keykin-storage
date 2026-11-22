@@ -158,9 +158,8 @@ describe('delete, the bin and the vault probe (BUD-12, vaults §6.4)', () => {
   const got = async () => (await fetch(`${b.url}/${sha(blob)}`)).status;
 
   it('passes the probe: one key deleting leaves the other key\'s copy', async () => {
-    const A = key(), B = key();
+    const A = key(), B = b.owner; // B mirrors, and only the owner may
     b.run.db.putAccount(A.pk, null, b.clock.now);
-    b.run.db.putAccount(B.pk, null, b.clock.now);
     assert.equal((await put(b, A, blob)).status, 201);
     assert.equal((await mirror(B, `${src.url}/blob`)).status, 200);
     assert.equal((await del(B, sha(blob))).status, 204);
@@ -307,14 +306,14 @@ describe('review fixes (2026-11-21)', () => {
   });
 
   it('does not let an account claim a blob it never had by mirroring its hash', async () => {
-    const thief = key();
-    b.run.db.putAccount(thief.pk, null, b.clock.now);
-    const mine = randomBytes(300);
-    await put(b, b.owner, mine);
-    // url serves other bytes: fetched and refused, no ownership taken
-    assert.equal((await mirror(thief, '/b', [sha(mine)])).status, 409);
-    assert.equal((await del(b.owner, sha(mine))).status, 204);
-    assert.notEqual(b.run.db.blob(sha(mine))!.binned, null);
+    const friend = key();
+    b.run.db.putAccount(friend.pk, null, b.clock.now);
+    const theirs = randomBytes(300);
+    await put(b, friend, theirs);
+    // url serves other bytes: fetched and refused, no ownership taken (the owner is the only one who may mirror)
+    assert.equal((await mirror(b.owner, '/b', [sha(theirs)])).status, 409);
+    assert.equal((await del(friend, sha(theirs))).status, 204);
+    assert.notEqual(b.run.db.blob(sha(theirs))!.binned, null);
   });
 
   it('with several x tags, stores what the url serves', async () => {
