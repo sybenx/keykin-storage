@@ -114,27 +114,27 @@ describe('quotas', () => {
 
   it('holds a friend to their quota, charges each account once, and not the owner', async () => {
     const friend = key(), other = key();
-    b.run.db.putAccount(friend.pk, 3000, b.clock.now);
-    b.run.db.putAccount(other.pk, 3000, b.clock.now);
-    const a = randomBytes(2000), c = randomBytes(2000);
+    b.run.db.putAccount(friend.pk, 30_000, b.clock.now);
+    b.run.db.putAccount(other.pk, 30_000, b.clock.now);
+    const a = randomBytes(20_000), c = randomBytes(20_000);
     assert.equal((await put(b, friend, a)).status, 201);
     assert.equal((await put(b, friend, a)).status, 200); // already theirs: free
     assert.equal((await put(b, friend, c)).status, 413);
-    assert.equal(b.run.db.usage(friend.pk), 2000);
+    assert.equal(b.run.db.usage(friend.pk), 20_000);
     assert.equal((await put(b, other, a)).status, 200); // same bytes, other account: charged to them too
-    assert.equal(b.run.db.usage(other.pk), 2000);
+    assert.equal(b.run.db.usage(other.pk), 20_000);
     assert.equal((await put(b, b.owner, randomBytes(900_000))).status, 201);
   });
 
   it('answers the preflight the way the upload would (BUD-06)', async () => {
     const friend = key();
-    b.run.db.putAccount(friend.pk, 1000, b.clock.now);
-    const pre = (k = friend, size = 500, x = sha('p')) => fetch(`${b.url}/upload`, {
+    b.run.db.putAccount(friend.pk, 10_000, b.clock.now);
+    const pre = (k = friend, size = 5000, x = sha('p')) => fetch(`${b.url}/upload`, {
       method: 'HEAD',
       headers: { authorization: auth(k, { t: 'upload', x: [x], now: b.clock.now }), 'x-sha-256': x, 'x-content-length': String(size) },
     });
     assert.equal((await pre()).status, 200);
-    assert.equal((await pre(friend, 1500)).status, 413);
+    assert.equal((await pre(friend, 15_000)).status, 413);
     assert.equal((await pre(key())).status, 403);
     const noLen = await fetch(`${b.url}/upload`, { method: 'HEAD', headers: { authorization: auth(friend, { t: 'upload', x: [sha('p')], now: b.clock.now }), 'x-sha-256': sha('p') } });
     assert.equal(noLen.status, 411);
@@ -296,14 +296,14 @@ describe('review fixes (2026-11-21)', () => {
 
   it('keeps what a friend binned on their quota, so delete-and-upload cannot fill the disk', async () => {
     const friend = key();
-    b.run.db.putAccount(friend.pk, 1000, b.clock.now);
-    const one = randomBytes(900), two = randomBytes(900);
+    b.run.db.putAccount(friend.pk, 10_000, b.clock.now);
+    const one = randomBytes(9000), two = randomBytes(9000);
     assert.equal((await put(b, friend, one)).status, 201);
     assert.equal((await del(friend, sha(one))).status, 204);
-    assert.equal(b.run.db.usage(friend.pk), 900);
+    assert.equal(b.run.db.usage(friend.pk), 9000);
     assert.equal((await put(b, friend, two)).status, 413);
     assert.equal((await put(b, friend, one)).status, 200); // its own binned blob comes back at no cost
-    assert.equal(b.run.db.usage(friend.pk), 900);
+    assert.equal(b.run.db.usage(friend.pk), 9000);
   });
 
   it('does not let an account claim a blob it never had by mirroring its hash', async () => {

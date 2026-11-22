@@ -15,10 +15,14 @@ export interface Config {
   owner: string;
   /** Largest blob, in bytes. */
   maxBlobBytes: number;
+  /** Most blobs an account with a quota may hold. */
+  maxBlobsPerAccount: number;
   /** Days a blob nobody owns stays in the bin before it's erased. */
   binDays: number;
   /** Mirror fetch timeout, ms. */
   mirrorTimeoutMs: number;
+  /** Tests only: uploads stop when the disk would have less than this left. Default 1 GiB. */
+  diskMarginBytes?: number;
   /** Tests only: let /mirror fetch from loopback and private addresses. */
   mirrorAllowPrivate?: boolean;
   /** Tests only: the clock, in Unix seconds. */
@@ -50,6 +54,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     domains: env.STORAGE_DOMAINS ? env.STORAGE_DOMAINS.split(',').map((d) => d.trim().toLowerCase()).filter(Boolean) : host ? [host] : [],
     owner,
     maxBlobBytes: Number(env.STORAGE_MAX_BLOB_MB || 256) * MiB,
+    maxBlobsPerAccount: Number(env.STORAGE_MAX_BLOBS || 200_000),
     binDays: Number(env.STORAGE_BIN_DAYS || 30),
     mirrorTimeoutMs: Number(env.STORAGE_MIRROR_TIMEOUT_S || 120) * 1000,
   };

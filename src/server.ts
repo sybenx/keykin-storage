@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { readAuth, type Auth, type Verb } from './auth.ts';
 import type { Config } from './config.ts';
-import { Db, type Account, type Blob } from './db.ts';
+import { Db, type Account, type Blob, type Pending } from './db.ts';
 import { guardedFetch, MirrorError } from './mirror.ts';
 import { Aborted, Store, TooLarge, type Received } from './store.ts';
 
@@ -54,7 +54,7 @@ export interface Running {
 
 export async function start(config: Config): Promise<Running> {
   const now = config.now ?? (() => Math.floor(Date.now() / 1000));
-  const db = new Db(join(config.dataDir, 'storage.db'));
+  const db = new Db(join(config.dataDir, 'storage.db'), { maxBlobs: config.maxBlobsPerAccount });
   const store = new Store(config.dataDir);
   const ready = !!config.owner && !!config.publicUrl && config.domains.length > 0;
   if (ready) db.putAccount(config.owner, null, now()); // the box owner: always an account, never a quota
@@ -101,7 +101,7 @@ export async function start(config: Config): Promise<Running> {
         const free = freeBytes(config.dataDir);
         let reserved = 0;
         for (const v of flight.by.values()) reserved += v.bytes;
-        if (free !== null && free - reserved - n < DISK_MARGIN) throw new HttpError(507, 'this box is out of disk space');
+        if (free !== null && free - reserved - n < (config.diskMarginBytes ?? DISK_MARGIN)) throw new HttpError(507, 'this box is out of disk space');
         mine += n;
         f.bytes += n;
       },
@@ -115,7 +115,16 @@ export async function start(config: Config): Promise<Running> {
       },
     };
   };
-  const pending = (account: Account) => flight.by.get(account.pubkey)?.bytes ?? 0;
+  const pending = (account: Account): Pending => {
+    const f = flight.by.get(account.pubkey);
+    return { bytes: f?.bytes ?? 0, n: f?.n ?? 0 };
+  };
+  /** Throws 413 unless one of the x tags fits (a blob already charged to the account always does). */
+  const mustFit = (account: Account, xs: string[], size: number) => {
+    let why: string | null = 'over your quota on this box';
+    for (const x of xs) if ((why = db.refusal(account, x, size, pending(account))) === null) return;
+    throw new HttpError(413, why!);
+  };
 
   const timer = setInterval(sweep, 3600_000);
   timer.unref();
@@ -196,7 +205,7 @@ export async function start(config: Config): Promise<Running> {
     if (size > config.maxBlobBytes) throw new HttpError(413, `blobs here are at most ${config.maxBlobBytes} bytes`);
     const claimed = header(req, 'x-sha-256')?.toLowerCase() ?? null;
     if (claimed && !auth.xs.includes(claimed)) throw new HttpError(403, 'x-sha-256 is not in the authorization');
-    if (!auth.xs.some((x) => db.fits(account, x, size, pending(account)))) throw new HttpError(413, 'over your quota on this box');
+    mustFit(account, auth.xs, size);
 
     const slot = take(account);
     let got: Received;
@@ -227,9 +236,10 @@ export async function start(config: Config): Promise<Running> {
       store.discard(got.tmp);
       throw new HttpError(403, 'blob does not match the authorization x tag');
     }
-    if (!db.fits(account, got.sha256, got.size, pending(account))) {
+    const why = db.refusal(account, got.sha256, got.size, pending(account));
+    if (why) {
       store.discard(got.tmp);
-      throw new HttpError(413, 'over your quota on this box');
+      throw new HttpError(413, why);
     }
     const had = db.blob(got.sha256);
     store.commit(got);
@@ -268,7 +278,7 @@ export async function start(config: Config): Promise<Running> {
     if (!auth.xs.includes(sha)) throw new HttpError(403, 'x-sha-256 is not in the authorization');
     const size = Number(len);
     if (size > config.maxBlobBytes) throw new HttpError(413, `blobs here are at most ${config.maxBlobBytes} bytes`);
-    if (!db.fits(account, sha, size, pending(account))) throw new HttpError(413, 'over your quota on this box');
+    mustFit(account, [sha], size);
     end(res, 200);
   }
 
@@ -305,9 +315,13 @@ export async function start(config: Config): Promise<Running> {
         src.body.destroy();
         throw new HttpError(413, `blobs here are at most ${config.maxBlobBytes} bytes`);
       }
-      if (src.length !== null && !auth.xs.some((x) => db.fits(account, x, size, pending(account)))) {
-        src.body.destroy();
-        throw new HttpError(413, 'over your quota on this box');
+      if (src.length !== null) {
+        try {
+          mustFit(account, auth.xs, size);
+        } catch (err) {
+          src.body.destroy();
+          throw err;
+        }
       }
       try {
         slot.grow(size);

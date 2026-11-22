@@ -23,6 +23,21 @@ export interface Account {
   blobs: number;
 }
 
+/** Every blob is charged at least this many bytes, so tiny blobs can't use up the disk's inodes for free. */
+export const MIN_CHARGE = 4096;
+export const cost = (size: number) => Math.max(size, MIN_CHARGE);
+
+export interface DbOptions {
+  /** Most blobs an account with a quota may hold (owned or in the bin on its name). */
+  maxBlobs?: number;
+}
+
+/** Uploads in flight for an account: their declared bytes and how many. */
+export interface Pending {
+  bytes: number;
+  n: number;
+}
+
 const ACCOUNT_COLS = 'a.pubkey, a.quota, a.added, a.used, a.blobs';
 
 /**
@@ -36,6 +51,8 @@ const MIGRATIONS: ((db: Db) => void)[] = [
     db.sql.exec('ALTER TABLE accounts ADD COLUMN blobs INTEGER NOT NULL DEFAULT 0');
     db.recountAll();
   },
+  // 0.2.0: each blob costs at least MIN_CHARGE
+  (db) => db.recountAll(),
 ];
 
 export interface Owned extends Blob {
@@ -44,8 +61,10 @@ export interface Owned extends Blob {
 
 export class Db {
   readonly sql: DatabaseSync;
+  readonly maxBlobs: number;
 
-  constructor(file: string) {
+  constructor(file: string, opts: DbOptions = {}) {
+    this.maxBlobs = opts.maxBlobs ?? 200_000;
     this.sql = new DatabaseSync(file);
     this.sql.exec(`
       PRAGMA journal_mode = WAL;
@@ -139,10 +158,10 @@ export class Db {
 
   /**
    * Counts what an account is charged from scratch: each blob any of its keys owns, once, plus what it last let go
-   * of that's still in the bin. O(blobs): only for checks, the upgrade and accounts being added.
+   * of that's still in the bin, each at least MIN_CHARGE bytes. O(blobs): only for checks, the upgrade and accounts being added.
    */
   count(account: string): { used: number; blobs: number } {
-    const r = this.sql.prepare(`SELECT COALESCE(SUM(size), 0) AS used, COUNT(*) AS blobs FROM blobs WHERE sha256 IN
+    const r = this.sql.prepare(`SELECT COALESCE(SUM(MAX(size, ${MIN_CHARGE})), 0) AS used, COUNT(*) AS blobs FROM blobs WHERE sha256 IN
       (SELECT o.sha256 FROM owners o JOIN keys k ON k.key = o.key WHERE k.account = ?)
       OR (binned IS NOT NULL AND binned_by = ?)`).get(account, account);
     return { used: Number(r!.used), blobs: Number(r!.blobs) };
@@ -165,7 +184,7 @@ export class Db {
 
   /** Adds (`sign` 1) or takes off (-1) one blob of `size` bytes from an account's running totals. */
   private charge(account: string, size: number, sign: 1 | -1): void {
-    this.sql.prepare('UPDATE accounts SET used = used + ?, blobs = blobs + ? WHERE pubkey = ?').run(sign * size, sign, account);
+    this.sql.prepare('UPDATE accounts SET used = used + ?, blobs = blobs + ? WHERE pubkey = ?').run(sign * cost(size), sign, account);
   }
 
   /** Whether any key of the account owns the blob. */
@@ -180,13 +199,20 @@ export class Db {
   }
 
   /**
-   * Whether `size` more bytes for this blob fit in the account's quota, with `pending` bytes of uploads in flight.
-   * Uses the running total on `account`, so read the account once per request and pass it in.
+   * Why this blob would not fit in the account's quota or blob cap, with `pending` uploads in flight, or null if
+   * it fits. Uses the running totals on `account`, so read the account once per request and pass it in.
+   * An account without a quota has no blob cap either.
    */
-  fits(account: Account, sha256: string | null, size: number, pending = 0): boolean {
-    if (account.quota === null) return true;
-    if (sha256 && this.charged(account.pubkey, sha256)) return true;
-    return account.used + pending + size <= account.quota;
+  refusal(account: Account, sha256: string | null, size: number, pending: Pending = { bytes: 0, n: 0 }): string | null {
+    if (account.quota === null) return null;
+    if (sha256 && this.charged(account.pubkey, sha256)) return null;
+    if (account.used + pending.bytes + cost(size) > account.quota) return 'over your quota on this box';
+    if (account.blobs + pending.n + 1 > this.maxBlobs) return `you hold ${this.maxBlobs} blobs here, the most an account may`;
+    return null;
+  }
+
+  fits(account: Account, sha256: string | null, size: number, pending?: Pending): boolean {
+    return this.refusal(account, sha256, size, pending) === null;
   }
 
   /** When `key` took its copy, or null. */

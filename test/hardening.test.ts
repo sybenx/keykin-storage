@@ -96,3 +96,34 @@ describe('1. quota math is O(1)', () => {
     assert.equal((await put(b, b.owner, body, { x: xs.slice(0, 16) })).status, 201);
   });
 });
+
+describe('2. small blobs cost at least 4 KiB, and an account holds a capped number of blobs', () => {
+  let b: Box;
+  before(async () => { b = await box({ maxBlobsPerAccount: 3 }); });
+  after(() => b.close());
+
+  it('charges a tiny blob 4096 bytes', async () => {
+    const friend = key();
+    b.run.db.putAccount(friend.pk, 10_000, b.clock.now);
+    assert.equal((await put(b, friend, randomBytes(10))).status, 201);
+    assert.equal((await put(b, friend, randomBytes(10))).status, 201);
+    assert.equal(b.run.db.accountOf(friend.pk)!.used, 8192);
+    assert.equal(b.run.db.usage(friend.pk), 8192);
+    assert.equal((await put(b, friend, randomBytes(10))).status, 413);
+  });
+
+  it('refuses a blob past the per-account blob cap', async () => {
+    const friend = key();
+    b.run.db.putAccount(friend.pk, 10 ** 9, b.clock.now);
+    for (let i = 0; i < 3; i++) assert.equal((await put(b, friend, randomBytes(10))).status, 201);
+    const r = await put(b, friend, randomBytes(10));
+    assert.equal(r.status, 413);
+    assert.match(r.headers.get('x-reason')!, /blobs/);
+  });
+
+  it('reads the cap from STORAGE_MAX_BLOBS, 200,000 by default', async () => {
+    const { configFromEnv } = await import('../src/config.ts');
+    assert.equal(configFromEnv({}).maxBlobsPerAccount, 200_000);
+    assert.equal(configFromEnv({ STORAGE_MAX_BLOBS: '50' }).maxBlobsPerAccount, 50);
+  });
+});
