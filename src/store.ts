@@ -9,6 +9,17 @@ import type { Readable } from 'node:stream';
 export class TooLarge extends Error {}
 /** The sender went away mid-upload. Not our fault, not worth a log line. */
 export class Aborted extends Error {}
+/** The sender is too slow: under the minimum rate over a whole window. */
+export class TooSlow extends Error {}
+
+export interface MinRate {
+  /** Length of the window, ms. */
+  windowMs: number;
+  /** Bytes per second the sender must average over each window. */
+  bytesPerSecond: number;
+  /** Bytes still expected in all (content-length), so the last short stretch isn't held to the full rate. */
+  expected?: number | null;
+}
 
 export interface Received {
   tmp: string;
@@ -51,17 +62,31 @@ export class Store {
     return existsSync(this.path(sha256));
   }
 
-  /** Streams `body` to a temp file, hashing it. Throws TooLarge past `max` bytes; the temp file is gone then. */
-  receive(body: Readable, max: number): Promise<Received> {
+  /**
+   * Streams `body` to a temp file, hashing it. Throws TooLarge past `max` bytes, and TooSlow when `rate` is given
+   * and a window goes by with fewer bytes than it asks for; the temp file is gone then.
+   */
+  receive(body: Readable, max: number, rate?: MinRate): Promise<Received> {
     const tmp = join(this.tmpDir, randomBytes(12).toString('hex'));
     const out = createWriteStream(tmp, { flags: 'wx' });
     const hash = createHash('sha256');
     let size = 0;
     return new Promise<Received>((resolve, reject) => {
       let done = false;
+      let timer: NodeJS.Timeout | undefined;
+      if (rate) {
+        const perWindow = (rate.bytesPerSecond * rate.windowMs) / 1000;
+        let mark = 0;
+        timer = setInterval(() => {
+          const left = rate.expected != null ? rate.expected - mark : Infinity;
+          if (size - mark < Math.min(perWindow, left)) stop(new TooSlow('upload too slow'));
+          mark = size;
+        }, rate.windowMs);
+      }
       const stop = (err: Error) => {
         if (done) return;
         done = true;
+        clearInterval(timer);
         body.unpipe(out);
         body.pause();
         // the file may not exist yet; remove it once the stream has closed either way
@@ -81,6 +106,7 @@ export class Store {
       out.on('finish', () => {
         if (done) return;
         done = true;
+        clearInterval(timer);
         resolve({ tmp, sha256: hash.digest('hex'), size });
       });
       body.pipe(out);

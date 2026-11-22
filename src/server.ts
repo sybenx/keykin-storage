@@ -11,7 +11,7 @@ import type { Config } from './config.ts';
 import { Db, type Account, type Blob, type Pending } from './db.ts';
 import { clientAddress, RateLimit } from './limit.ts';
 import { guardedFetch, MirrorError } from './mirror.ts';
-import { Aborted, Store, TooLarge, type Received } from './store.ts';
+import { Aborted, Store, TooLarge, TooSlow, type MinRate, type Received } from './store.ts';
 
 const SHA_PATH = /^\/([0-9a-fA-F]{64})(\.[A-Za-z0-9]{1,10})?$/;
 const LIST_PATH = /^\/list\/([0-9a-fA-F]{64})$/;
@@ -26,6 +26,8 @@ const MAX_IN_FLIGHT = 32;
 const MAX_IN_FLIGHT_PER_ACCOUNT = 4;
 /** Uploads stop when the disk would have less than this left. */
 const DISK_MARGIN = 1024 ** 3;
+/** An upload averaging under this many bytes a second over a minute is cut off, so it can't hold a slot forever. */
+const MIN_RATE = 16 * 1024;
 
 function freeBytes(dir: string): number | null {
   try {
@@ -84,7 +86,8 @@ export async function start(config: Config): Promise<Running> {
     });
   });
   server.requestTimeout = 0; // a big upload on a slow link may take hours…
-  server.timeout = 60_000; // …but a socket that sends nothing for a minute is closed
+  server.timeout = 60_000; // …but a socket that sends nothing for a minute is closed, one that sends under the
+  // minimum rate over a minute is cut off (receive), and the small /mirror body has a deadline (readSmall)
   server.headersTimeout = 60_000;
 
   // uploads and mirrors in flight: a cap per account and overall, and their declared bytes count against quota
@@ -225,7 +228,9 @@ export async function start(config: Config): Promise<Running> {
     let got: Received;
     try {
       slot.grow(size);
-      got = await receive(req, size);
+      got = await receive(req, size, {
+        windowMs: config.uploadWindowMs ?? 60_000, bytesPerSecond: config.minUploadBytesPerSecond ?? MIN_RATE, expected: size,
+      });
     } finally {
       slot.release();
     }
@@ -266,9 +271,9 @@ export async function start(config: Config): Promise<Running> {
     json(res, had ? 200 : 201, descriptor(db.blob(got.sha256)!, db.uploadedAt(got.sha256, auth.pubkey) ?? now()));
   }
 
-  async function receive(body: Readable, declared: number | null): Promise<Received> {
+  async function receive(body: Readable, declared: number | null, rate?: MinRate): Promise<Received> {
     try {
-      const got = await store.receive(body, config.maxBlobBytes);
+      const got = await store.receive(body, config.maxBlobBytes, rate);
       if (declared !== null && got.size !== declared) {
         store.discard(got.tmp);
         throw new HttpError(400, 'body length does not match content-length');
@@ -277,6 +282,7 @@ export async function start(config: Config): Promise<Running> {
     } catch (err) {
       if (err instanceof TooLarge) throw new HttpError(413, `blobs here are at most ${config.maxBlobBytes} bytes`);
       if (err instanceof Aborted) throw new HttpError(400, 'upload aborted');
+      if (err instanceof TooSlow) throw new HttpError(408, 'upload too slow: under 16 KiB a second for a minute');
       throw err;
     }
   }
@@ -299,13 +305,14 @@ export async function start(config: Config): Promise<Running> {
   // --- BUD-04
 
   async function mirror(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    res.setHeader('connection', 'close'); // a refused mirror's body isn't read
     const { auth, account } = writer(req, 'upload');
     // a mirror makes this box fetch a url someone else chose, from the box's home address: the owner's call only
     if (account.pubkey !== config.owner) throw new HttpError(403, 'mirror is only for the owner of this box; upload instead');
     if (auth.xs.length === 0) throw new HttpError(401, 'mirror authorization needs an x tag');
     let url: unknown;
     try {
-      url = JSON.parse((await readSmall(req, 8192)).toString('utf8'))?.url;
+      url = JSON.parse((await readSmall(req, 8192, config.mirrorBodyTimeoutMs ?? 10_000)).toString('utf8'))?.url;
     } catch (err) {
       if (err instanceof HttpError) throw err;
       throw new HttpError(400, 'body must be {"url": "…"}');
@@ -465,19 +472,30 @@ export function parseRange(h: string | undefined, size: number): [number, number
   return [start, endAt];
 }
 
-function readSmall(req: http.IncomingMessage, max: number): Promise<Buffer> {
+function readSmall(req: http.IncomingMessage, max: number, timeoutMs: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const parts: Buffer[] = [];
     let n = 0;
+    const timer = setTimeout(() => {
+      req.pause();
+      reject(new HttpError(408, 'body too slow'));
+    }, timeoutMs);
     req.on('data', (c: Buffer) => {
       n += c.length;
       if (n > max) {
+        clearTimeout(timer);
         req.destroy();
         return reject(new HttpError(413, 'body too large'));
       }
       parts.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(parts)));
-    req.on('error', reject);
+    req.on('end', () => {
+      clearTimeout(timer);
+      resolve(Buffer.concat(parts));
+    });
+    req.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
   });
 }

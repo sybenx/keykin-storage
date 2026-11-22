@@ -26,6 +26,12 @@ export interface Config {
   /** Signed requests an address may send at once, and per second after that. Defaults 60 and 10. */
   authBurst?: number;
   authPerSecond?: number;
+  /** Tests only: an upload must average this many bytes a second over each window (default 16 KiB/s)… */
+  minUploadBytesPerSecond?: number;
+  /** …of this many ms (default 60 s). */
+  uploadWindowMs?: number;
+  /** Tests only: how long the small JSON body of /mirror may take to arrive, ms (default 10 s). */
+  mirrorBodyTimeoutMs?: number;
   /** Tests only: uploads stop when the disk would have less than this left. Default 1 GiB. */
   diskMarginBytes?: number;
   /** Tests only: let /mirror fetch from loopback and private addresses. */

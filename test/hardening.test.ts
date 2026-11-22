@@ -279,3 +279,56 @@ describe('6. tokens age out', () => {
     assert.equal((await put(b, b.owner, randomBytes(10), { createdAt: b.clock.now - 24 * H })).status, 201);
   });
 });
+
+describe('7. slow uploads and slow mirror bodies are cut off', () => {
+  let b: Box;
+  // a 200 ms window at 16 KiB/s: at least 3,276 bytes per window
+  before(async () => { b = await box({ uploadWindowMs: 200, mirrorBodyTimeoutMs: 300 }); });
+  after(() => b.close());
+  const http = () => import('node:http');
+
+  it('aborts an upload that trickles in under the minimum rate, and frees its slot', async () => {
+    const body = randomBytes(100_000);
+    const req = (await http()).request(`${b.url}/upload`, {
+      method: 'PUT', headers: { authorization: auth(b.owner, { t: 'upload', x: [sha(body)], now: b.clock.now }), 'content-length': String(body.length) },
+    });
+    const answer = new Promise<number>((r) => { req.on('response', (m) => { m.resume(); r(m.statusCode!); }); req.on('error', () => r(-1)); });
+    let i = 0;
+    const drip = setInterval(() => { if (i < body.length) req.write(body.subarray(i, i += 100)); }, 50);
+    const t = Date.now();
+    const status = await answer;
+    clearInterval(drip);
+    req.destroy();
+    assert.equal(status, 408);
+    assert.ok(Date.now() - t < 2000);
+    assert.equal(b.run.db.blob(sha(body)), null);
+    // the slot is free again: four more uploads at once still fit
+    const rs = await Promise.all(Array.from({ length: 4 }, () => put(b, b.owner, randomBytes(10))));
+    assert.deepEqual(rs.map((r) => r.status), [201, 201, 201, 201]);
+  });
+
+  it('lets an upload through that keeps up, even across several windows', async () => {
+    const body = randomBytes(60_000);
+    const req = (await http()).request(`${b.url}/upload`, {
+      method: 'PUT', headers: { authorization: auth(b.owner, { t: 'upload', x: [sha(body)], now: b.clock.now }), 'content-length': String(body.length) },
+    });
+    const answer = new Promise<number>((r) => { req.on('response', (m) => { m.resume(); r(m.statusCode!); }); req.on('error', () => r(-1)); });
+    for (let i = 0; i < body.length; i += 6000) {
+      req.write(body.subarray(i, i + 6000)); // 6,000 bytes per 100 ms: well over the minimum
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    req.end();
+    assert.equal(await answer, 201);
+  });
+
+  it('gives the /mirror body a deadline', async () => {
+    const req = (await http()).request(`${b.url}/mirror`, {
+      method: 'PUT', headers: { authorization: auth(b.owner, { t: 'upload', x: [sha('m')], now: b.clock.now }), 'content-length': '100' },
+    });
+    const answer = new Promise<number>((r) => { req.on('response', (m) => { m.resume(); r(m.statusCode!); }); req.on('error', () => r(-1)); });
+    req.write('{"url": "http');
+    const status = await Promise.race([answer, new Promise<number>((r) => setTimeout(() => r(0), 3000))]);
+    req.destroy();
+    assert.equal(status, 408);
+  });
+});
