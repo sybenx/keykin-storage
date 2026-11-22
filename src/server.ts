@@ -250,33 +250,31 @@ export async function start(config: Config): Promise<Running> {
   }
 
   /**
-   * Puts a received blob in place and records the owner: the last checks and both writes in one synchronous step,
-   * so the bin sweeper or a removed account can't slip in between.
+   * Puts a received blob in place and records the owner: the account check, the quota check, the file move and the
+   * database write in one transaction, so the bin sweeper or a removed account (even from the CLI, another
+   * process) can't slip in between.
    */
   function finish(res: http.ServerResponse, got: Received, type: string, auth: Auth): void {
-    const account = db.accountOf(auth.pubkey); // again: it may have been removed while the body came in
-    if (!account) {
-      store.discard(got.tmp);
-      throw new HttpError(403, 'this key may not write here');
-    }
     if (!auth.xs.includes(got.sha256)) {
       store.discard(got.tmp);
       throw new HttpError(403, 'blob does not match the authorization x tag');
     }
-    const why = db.refusal(account, got.sha256, got.size, pending(account));
-    if (why) {
-      store.discard(got.tmp);
-      throw new HttpError(413, why);
-    }
-    const had = db.blob(got.sha256);
-    store.commit(got);
+    let placedNew = false;
+    let r: ReturnType<Db['ownAsWriter']>;
     try {
-      db.own(got.sha256, got.size, had?.type ?? type, auth.pubkey, now());
+      r = db.ownAsWriter(got.sha256, got.size, type, auth.pubkey, now(), pending, () => {
+        placedNew = !store.has(got.sha256);
+        store.commit(got);
+      });
     } catch (err) {
-      if (!had) store.remove(got.sha256); // no row, no file
+      if (placedNew) store.remove(got.sha256); // no row, no file
       throw err;
     }
-    json(res, had ? 200 : 201, descriptor(db.blob(got.sha256)!, db.uploadedAt(got.sha256, auth.pubkey) ?? now()));
+    if (!r.ok) {
+      store.discard(got.tmp);
+      throw new HttpError(r.status, r.reason);
+    }
+    json(res, r.isNew ? 201 : 200, descriptor(db.blob(got.sha256)!, db.uploadedAt(got.sha256, auth.pubkey) ?? now()));
   }
 
   async function receive(body: Readable, declared: number | null, rate?: MinRate): Promise<Received> {

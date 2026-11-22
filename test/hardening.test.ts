@@ -382,3 +382,49 @@ describe('9. a malformed request line is a quiet 400', () => {
     assert.equal(logged.mock.callCount(), 0);
   });
 });
+
+describe('10. the account check and the ownership write are one transaction', () => {
+  let b: Box;
+  before(async () => { b = await box(); });
+  after(() => b.close());
+
+  it('never leaves a removed account owning a blob, even when the CLI removes it mid-check', async () => {
+    const { Db } = await import('../src/db.ts');
+    const friend = key();
+    b.run.db.putAccount(friend.pk, null, b.clock.now);
+    const cliDb = new Db(join(b.dir, 'storage.db'));
+    cliDb.sql.exec('PRAGMA busy_timeout = 0'); // like another process: fails fast while the server holds the write lock
+    let armed = false, removed = false;
+    const db = b.run.db as any;
+    const accountOf = db.accountOf.bind(db);
+    db.accountOf = (k: string) => {
+      const r = accountOf(k);
+      if (armed && !removed && k === friend.pk) {
+        armed = false;
+        const tryRemove = () => {
+          try { cliDb.removeAccount(friend.pk, b.clock.now); removed = true; } catch { setTimeout(tryRemove, 5); }
+        };
+        tryRemove(); // right after the server's check
+      }
+      return r;
+    };
+    try {
+      const body = randomBytes(1000);
+      const req = (await import('node:http')).request(`${b.url}/upload`, {
+        method: 'PUT', headers: { authorization: auth(friend, { t: 'upload', x: [sha(body)], now: b.clock.now }), 'content-length': '1000' },
+      });
+      const res = new Promise<number>((r) => req.on('response', (m) => { m.resume(); r(m.statusCode!); }));
+      req.write(body.subarray(0, 500));
+      await new Promise((r) => setTimeout(r, 50));
+      armed = true;
+      req.end(body.subarray(500));
+      await res;
+      while (!removed) await new Promise((r) => setTimeout(r, 5));
+      assert.equal(b.run.db.accountOf(friend.pk), null);
+      assert.equal(b.run.db.uploadedAt(sha(body), friend.pk), null, 'a removed account still owns the blob');
+    } finally {
+      db.accountOf = accountOf;
+      cliDb.close();
+    }
+  });
+});

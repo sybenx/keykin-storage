@@ -254,20 +254,39 @@ export class Db {
 
   /** Records that `key` holds the blob. Takes it out of the bin if it was there. Returns whether the blob is new. */
   own(sha256: string, size: number, type: string, key: string, now: number): boolean {
+    return this.tx(() => this.ownIn(sha256, size, type, key, now));
+  }
+
+  /**
+   * `own` for an upload or mirror, in one transaction: checks that `key` still writes for an account and that the
+   * blob still fits, then calls `place` (which moves the file into place) and records the owner. A CLI `remove`
+   * from another process can't land between the check and the write.
+   */
+  ownAsWriter(sha256: string, size: number, type: string, key: string, now: number, pending: (a: Account) => Pending, place: () => void):
+      { ok: true; isNew: boolean } | { ok: false; status: number; reason: string } {
     return this.tx(() => {
-      const had = this.blob(sha256);
-      const account = this.accountKey(key);
-      const was = account !== null && this.charged(account, sha256);
-      const binnedBy = had && had.binned !== null ? this.binnedBy(sha256) : null;
-      if (!had) this.sql.prepare('INSERT INTO blobs (sha256, size, type, created, binned) VALUES (?, ?, ?, ?, NULL)').run(sha256, size, type, now);
-      else if (had.binned !== null) this.sql.prepare('UPDATE blobs SET binned = NULL, binned_by = NULL WHERE sha256 = ?').run(sha256);
-      this.sql.prepare('INSERT OR IGNORE INTO owners (sha256, key, uploaded) VALUES (?, ?, ?)').run(sha256, key, now);
-      const cost = had ? had.size : size;
-      if (account !== null && !was) this.charge(account, cost, 1);
-      // out of the bin: off the quota of whoever let go of it last, unless that's this account
-      if (binnedBy !== null && binnedBy !== account) this.charge(binnedBy, cost, -1);
-      return !had;
+      const account = this.accountOf(key);
+      if (!account) return { ok: false, status: 403, reason: 'this key may not write here' };
+      const why = this.refusal(account, sha256, size, pending(account));
+      if (why) return { ok: false, status: 413, reason: why };
+      place();
+      return { ok: true, isNew: this.ownIn(sha256, size, type, key, now) };
     });
+  }
+
+  private ownIn(sha256: string, size: number, type: string, key: string, now: number): boolean {
+    const had = this.blob(sha256);
+    const account = this.accountKey(key);
+    const was = account !== null && this.charged(account, sha256);
+    const binnedBy = had && had.binned !== null ? this.binnedBy(sha256) : null;
+    if (!had) this.sql.prepare('INSERT INTO blobs (sha256, size, type, created, binned) VALUES (?, ?, ?, ?, NULL)').run(sha256, size, type, now);
+    else if (had.binned !== null) this.sql.prepare('UPDATE blobs SET binned = NULL, binned_by = NULL WHERE sha256 = ?').run(sha256);
+    this.sql.prepare('INSERT OR IGNORE INTO owners (sha256, key, uploaded) VALUES (?, ?, ?)').run(sha256, key, now);
+    const bytes = had ? had.size : size;
+    if (account !== null && !was) this.charge(account, bytes, 1);
+    // out of the bin: off the quota of whoever let go of it last, unless that's this account
+    if (binnedBy !== null && binnedBy !== account) this.charge(binnedBy, bytes, -1);
+    return !had;
   }
 
   /** `key` lets go of its copy. When nobody owns the blob any more it goes to the bin. Returns whether `key` owned it. */
