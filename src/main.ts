@@ -15,6 +15,8 @@ const running = await start(config);
 console.log(config.owner && config.publicUrl
   ? `keykin-storage on ${config.host}:${config.port}, ${config.publicUrl}, owner ${npub(config.owner)}`
   : `keykin-storage on ${config.host}:${config.port}, NOT SET UP: set STORAGE_PUBLIC_URL and STORAGE_OWNER; writes are refused until then`);
+console.log(`storage key (register it on your home): ${running.serviceKey.pk} ${npub(running.serviceKey.pk)}`);
+console.log(config.homeUrl ? `accounts follow the member list of ${config.homeUrl}, every ${config.homePollS} s` : 'no home set: only accounts added by hand may write');
 
 let stopping = false;
 const stop = () => {

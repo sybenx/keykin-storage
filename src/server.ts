@@ -9,8 +9,10 @@ import type { Readable } from 'node:stream';
 import { checkAuth, parseAuth, type Auth, type Verb } from './auth.ts';
 import type { Config } from './config.ts';
 import { Db, type Account, type Blob, type Pending } from './db.ts';
+import { Home, httpHome, type HomeSource } from './home.ts';
 import { clientAddress, RateLimit } from './limit.ts';
 import { guardedFetch, MirrorError } from './mirror.ts';
+import { serviceKey, type ServiceKey } from './servicekey.ts';
 import { Aborted, Store, TooLarge, TooSlow, type MinRate, type Received } from './store.ts';
 
 const SHA_PATH = /^\/([0-9a-fA-F]{64})(\.[A-Za-z0-9]{1,10})?$/;
@@ -52,15 +54,29 @@ export interface Running {
   url: string;
   /** Erases blobs whose time in the bin is up. Runs hourly by itself; exposed for tests. */
   sweep(): number;
+  /** This storage's own key (public half shown at start and by `home key`). */
+  serviceKey: ServiceKey;
+  /** Follows the home's member list, when STORAGE_HOME_URL is set and the box is set up. */
+  home: Home | null;
   close(): Promise<void>;
 }
 
-export async function start(config: Config): Promise<Running> {
+export async function start(config: Config, opts: { homeSource?: HomeSource } = {}): Promise<Running> {
   const now = config.now ?? (() => Math.floor(Date.now() / 1000));
+  const log = config.log ?? ((line: string) => console.log(line));
   const db = new Db(join(config.dataDir, 'storage.db'), { maxBlobs: config.maxBlobsPerAccount });
   const store = new Store(config.dataDir);
   const ready = !!config.owner && !!config.publicUrl && config.domains.length > 0;
   if (ready) db.putAccount(config.owner, null, now()); // the box owner: always an account, never a quota
+  const key = serviceKey(config.dataDir);
+  // with no home set, accounts that came from one don't write (nothing is deleted either), as before homes existed
+  db.membersWrite = !!config.homeUrl;
+  const home = ready && config.homeUrl
+    ? new Home(db, opts.homeSource ?? httpHome(config.homeUrl, key, { timeoutMs: config.homeTimeoutMs ?? 10_000, now }), {
+      owner: config.owner, memberQuota: config.memberQuota, pollS: config.homePollS, now, log, removeFile: (s) => store.remove(s),
+    })
+    : null;
+  if (home) db.saveHomeState({ url: config.homeUrl });
 
   const sweep = (): number => {
     const before = now() - config.binDays * DAY;
@@ -172,11 +188,16 @@ export async function start(config: Config): Promise<Running> {
 
   // --- auth
 
-  function writer(req: http.IncomingMessage, verb: Verb): { auth: Auth; account: Account } {
+  async function writer(req: http.IncomingMessage, verb: Verb): Promise<{ auth: Auth; account: Account }> {
     const p = parseAuth(req.headers.authorization);
     if (!p.ok) throw new HttpError(p.status, p.reason);
     // a key with no account here is refused before its signature is checked: strangers cost one lookup
-    const account = db.accountOf(p.event.pubkey);
+    let account = db.accountOf(p.event.pubkey);
+    if (!account && home) {
+      // maybe a member who just joined: ask the home again (at most once a minute, whoever asks)
+      await home.lookUp();
+      account = db.accountOf(p.event.pubkey);
+    }
     if (!account) throw new HttpError(403, 'this key may not write here');
     return { auth: verified(p.event, verb), account };
   }
@@ -222,7 +243,7 @@ export async function start(config: Config): Promise<Running> {
 
   async function upload(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     res.setHeader('connection', 'close'); // a refused upload's body isn't read
-    const { auth, account } = writer(req, 'upload');
+    const { auth, account } = await writer(req, 'upload');
     if (auth.xs.length === 0) throw new HttpError(401, 'upload authorization needs an x tag');
     const len = req.headers['content-length'];
     if (!len || !/^\d+$/.test(len)) throw new HttpError(411, 'content-length required');
@@ -295,8 +316,8 @@ export async function start(config: Config): Promise<Running> {
 
   // --- BUD-06
 
-  function preflight(req: http.IncomingMessage, res: http.ServerResponse): void {
-    const { auth, account } = writer(req, 'upload');
+  async function preflight(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const { auth, account } = await writer(req, 'upload');
     const sha = header(req, 'x-sha-256')?.toLowerCase();
     const len = header(req, 'x-content-length');
     if (!len || !/^\d+$/.test(len)) throw new HttpError(411, 'x-content-length required');
@@ -312,7 +333,7 @@ export async function start(config: Config): Promise<Running> {
 
   async function mirror(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     res.setHeader('connection', 'close'); // a refused mirror's body isn't read
-    const { auth, account } = writer(req, 'upload');
+    const { auth, account } = await writer(req, 'upload');
     // a mirror makes this box fetch a url someone else chose, from the box's home address: the owner's call only
     if (account.pubkey !== config.owner) throw new HttpError(403, 'mirror is only for the owner of this box; upload instead');
     if (auth.xs.length === 0) throw new HttpError(401, 'mirror authorization needs an x tag');
@@ -408,6 +429,8 @@ export async function start(config: Config): Promise<Running> {
   }
 
   await new Promise<void>((resolve) => server.listen(config.port, config.host, resolve));
+  home?.start();
+  let closed: Promise<void> | null = null;
   const addr = server.address();
   const port = typeof addr === 'object' && addr ? addr.port : config.port;
 
@@ -416,14 +439,23 @@ export async function start(config: Config): Promise<Running> {
     db,
     url: `http://${config.host === '0.0.0.0' ? '127.0.0.1' : config.host}:${port}`,
     sweep,
-    close: () => new Promise<void>((resolve) => {
-      clearInterval(timer);
-      server.closeAllConnections();
-      server.close(() => {
-        db.close();
-        resolve();
-      });
-    }),
+    serviceKey: key,
+    home,
+    close: async () => {
+      // safe to call twice: the second call waits for the first
+      closed ??= (async () => {
+        await home?.stop();
+        await new Promise<void>((resolve) => {
+          clearInterval(timer);
+          server.closeAllConnections();
+          server.close(() => {
+            db.close();
+            resolve();
+          });
+        });
+      })();
+      return closed;
+    },
   };
 }
 

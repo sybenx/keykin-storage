@@ -64,7 +64,7 @@ export async function box(over: Partial<Config> = {}, opts: { dir?: string; owne
   const clock = { now: Math.floor(Date.now() / 1000) };
   const run = await start({
     dataDir: dir, host: '127.0.0.1', port: 0, publicUrl: `https://${DOMAIN}`, domains: [DOMAIN], owner: owner.pk,
-    maxBlobBytes: 1024 * 1024, maxBlobsPerAccount: 200_000, binDays: 30, mirrorTimeoutMs: 5000, diskMarginBytes: 0, behindCloudflare: false, now: () => clock.now, ...over,
+    maxBlobBytes: 1024 * 1024, maxBlobsPerAccount: 200_000, binDays: 30, mirrorTimeoutMs: 5000, diskMarginBytes: 0, behindCloudflare: false, homeUrl: '', memberQuota: 5e9, homePollS: 300, now: () => clock.now, ...over,
   });
   return {
     run, url: run.url, owner, clock, dir,
@@ -109,4 +109,49 @@ export function cli(dir: string, ...rest: unknown[]): string {
   } catch (err: any) {
     throw new Error(`cli ${rest.join(' ')} failed: ${err.stdout ?? ''}${err.stderr ?? ''}`);
   }
+}
+
+export interface FakeHome {
+  url: string;
+  /** What the home answers next: a status and a body (string or JSON). */
+  reply: () => { status: number; body: unknown };
+  /** Requests that came in, and why any of them failed the home's checks. */
+  calls: number;
+  refused: string[];
+  close(): Promise<void>;
+}
+
+/**
+ * A home on a loopback port that checks each memberkeys request the way the real one does: POST /, the content
+ * type, a kind 27235 event signed by `registered` with u = this url, method POST, payload = sha256 of the exact body,
+ * created_at within 60 s of `clock`. Answers 401 when a check fails (and records why), else `reply()`.
+ */
+export async function fakeHome(registered: () => string, clock: () => number): Promise<FakeHome> {
+  const { verifyEvent } = await import('./nip98.ts');
+  const h: FakeHome = {
+    url: '', calls: 0, refused: [],
+    reply: () => ({ status: 200, body: { result: { owner: registered(), members: [], removed: [] } } }),
+    close: async () => {},
+  };
+  const s = http.createServer((req, res) => {
+    const parts: Buffer[] = [];
+    req.on('data', (c) => parts.push(c));
+    req.on('end', () => {
+      h.calls++;
+      const body = Buffer.concat(parts).toString('utf8');
+      const why = verifyEvent(req, body, `${h.url}/`, registered(), clock());
+      const send = (status: number, b: unknown) => res.writeHead(status, { 'content-type': 'application/json' }).end(typeof b === 'string' ? b : JSON.stringify(b));
+      if (why === 'unregistered') return send(401, { error: "memberkeys is only for this relay's storage service" });
+      if (why) {
+        h.refused.push(why);
+        return send(401, { error: why });
+      }
+      const r = h.reply();
+      send(r.status, r.body);
+    });
+  });
+  await new Promise<void>((r) => s.listen(0, '127.0.0.1', r));
+  h.url = `http://127.0.0.1:${(s.address() as { port: number }).port}`;
+  h.close = () => new Promise<void>((r) => { s.closeAllConnections(); s.close(() => r()); });
+  return h;
 }

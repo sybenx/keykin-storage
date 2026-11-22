@@ -21,6 +21,16 @@ export interface Config {
   binDays: number;
   /** Mirror fetch timeout, ms. */
   mirrorTimeoutMs: number;
+  /** The home whose member list says who may upload here (https), or '' when there is none. */
+  homeUrl: string;
+  /** Quota of an account that came from the home's member list, in bytes. */
+  memberQuota: number;
+  /** How often to fetch the member list, seconds. */
+  homePollS: number;
+  /** Tests only: how long one member list fetch may take, ms (default 10 s). */
+  homeTimeoutMs?: number;
+  /** Where log lines go (default console.log). */
+  log?: (line: string) => void;
   /** Whether requests come through Cloudflare, so CF-Connecting-IP names the client. Otherwise the socket does. */
   behindCloudflare: boolean;
   /** Signed requests an address may send at once, and per second after that. Defaults 60 and 10. */
@@ -43,6 +53,34 @@ export interface Config {
 const MiB = 1024 * 1024;
 
 /**
+ * A size like 10G, 500M, 5.5T or 123 (bytes; K, M, G, T are powers of 1000, a trailing B is allowed), or null for
+ * `unlimited` when `unlimited` is allowed. Throws on anything else.
+ */
+export function parseSize(s: string, unlimited = false): number | null {
+  const t = s.trim();
+  if (unlimited && t === 'unlimited') return null;
+  const m = /^(\d+(?:\.\d+)?)\s*([KMGT]?)B?$/i.exec(t);
+  const n = m ? Math.round(Number(m[1]) * 1000 ** ' KMGT'.indexOf(m[2].toUpperCase() || ' ')) : NaN;
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`give a size like 10G or 500M${unlimited ? ', or unlimited' : ''}`);
+  return n;
+}
+
+/** The home's url: https only (no credentials), with no trailing slash. */
+function homeUrl(env: NodeJS.ProcessEnv): string {
+  const raw = (env.STORAGE_HOME_URL ?? '').trim().replace(/\/+$/, '');
+  if (!raw) return '';
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error('STORAGE_HOME_URL is not a url');
+  }
+  if (u.protocol !== 'https:') throw new Error('STORAGE_HOME_URL must be an https url');
+  if (u.username || u.password || u.search || u.hash) throw new Error('STORAGE_HOME_URL must be a plain https url, with no credentials, query or #');
+  return raw;
+}
+
+/**
  * A numeric setting: unset or empty gives `fallback`; otherwise it must be a positive finite number (a whole one
  * when `integer`), or it's an error naming the setting. A typo like `256M` must not quietly remove a cap.
  */
@@ -54,6 +92,16 @@ function number(env: NodeJS.ProcessEnv, name: string, fallback: number, opts: { 
     throw new Error(`${name} must be a positive ${opts.integer ? 'whole ' : ''}number${opts.max !== undefined ? ` up to ${opts.max}` : ''}, not "${raw}"`);
   }
   return n;
+}
+
+function memberQuota(env: NodeJS.ProcessEnv): number {
+  const raw = (env.STORAGE_MEMBER_QUOTA ?? '').trim();
+  if (!raw) return 5e9;
+  try {
+    return parseSize(raw)!;
+  } catch {
+    throw new Error(`STORAGE_MEMBER_QUOTA must be a size like 5G or 500M, not "${raw}"`);
+  }
 }
 
 /** A yes/no setting: true, yes, 1 or false, no, 0 (empty is no). Anything else is an error naming the setting. */
@@ -92,5 +140,8 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     binDays: number(env, 'STORAGE_BIN_DAYS', 30),
     mirrorTimeoutMs: number(env, 'STORAGE_MIRROR_TIMEOUT_S', 120) * 1000,
     behindCloudflare: flag(env, 'STORAGE_BEHIND_CLOUDFLARE'),
+    homeUrl: homeUrl(env),
+    memberQuota: memberQuota(env),
+    homePollS: number(env, 'STORAGE_HOME_POLL_S', 300),
   };
 }

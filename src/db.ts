@@ -21,6 +21,35 @@ export interface Account {
   used: number;
   /** Blobs charged to the account. */
   blobs: number;
+  /** 1 when added by hand (the CLI, or the box owner): its quota is the one set by hand. */
+  hand: number;
+  /** 1 while the home's member list has it. */
+  member: number;
+}
+
+/** A removal from the home's member list, as this box recorded it the first time it saw it. */
+export interface Removal {
+  pubkey: string;
+  removedAt: number;
+  deletesAt: number | null;
+  reason: 'removed' | 'erased';
+  /** When this box noticed. */
+  noticed: number;
+}
+
+/** What this box knows about the home: kept in the database so a restart, or the CLI, sees the same. */
+export interface HomeState {
+  url: string | null;
+  /** When the last good member list came in, and the list itself (JSON). */
+  lastGood: number | null;
+  list: string | null;
+  lastTry: number | null;
+  /** Why the last try failed (a HomeError kind and message), or null when it worked. */
+  errorKind: string | null;
+  error: string | null;
+  /** Removals held back for `home apply` (JSON array of {pubkey, removedAt, reason}), and since when. */
+  held: string | null;
+  heldSince: number | null;
 }
 
 /** Every blob is charged at least this many bytes, so tiny blobs can't use up the disk's inodes for free. */
@@ -38,7 +67,7 @@ export interface Pending {
   n: number;
 }
 
-const ACCOUNT_COLS = 'a.pubkey, a.quota, a.added, a.used, a.blobs';
+const ACCOUNT_COLS = 'a.pubkey, a.quota, a.added, a.used, a.blobs, a.hand, a.member';
 
 /**
  * Schema changes after 0.1.0, in order. `PRAGMA user_version` says how many have run. Each runs once, in a
@@ -53,6 +82,22 @@ const MIGRATIONS: ((db: Db) => void)[] = [
   },
   // 0.2.0: each blob costs at least MIN_CHARGE
   (db) => db.recountAll(),
+  // 0.2.0: accounts that follow the home's member list
+  (db) => db.sql.exec(`
+    ALTER TABLE accounts ADD COLUMN hand INTEGER NOT NULL DEFAULT 1;
+    ALTER TABLE accounts ADD COLUMN member INTEGER NOT NULL DEFAULT 0;
+    -- what a removed member's keys owned, so a member who comes back before the bin erases gets it back
+    CREATE TABLE parked (
+      account TEXT NOT NULL, sha256 TEXT NOT NULL REFERENCES blobs(sha256) ON DELETE CASCADE, key TEXT NOT NULL,
+      uploaded INTEGER NOT NULL, PRIMARY KEY (account, sha256, key));
+    CREATE INDEX parked_by_sha ON parked(sha256);
+    -- removals from the home's list, recorded the first time they're seen (the home lists them for 14 days only)
+    CREATE TABLE home_removed (
+      pubkey TEXT PRIMARY KEY, removed_at INTEGER NOT NULL, deletes_at INTEGER, reason TEXT NOT NULL, noticed INTEGER NOT NULL);
+    CREATE TABLE home_state (
+      id INTEGER PRIMARY KEY CHECK (id = 1), url TEXT, last_good INTEGER, list TEXT, last_try INTEGER, error_kind TEXT,
+      error TEXT, held TEXT, held_since INTEGER);
+    INSERT INTO home_state (id) VALUES (1);`),
 ];
 
 export interface Owned extends Blob {
@@ -62,6 +107,12 @@ export interface Owned extends Blob {
 export class Db {
   readonly sql: DatabaseSync;
   readonly maxBlobs: number;
+  /**
+   * Whether accounts that came only from the home's member list may write. The server sets it from whether a home
+   * is set: with no home, only accounts added by hand write, as before members existed, and nothing is deleted.
+   */
+  membersWrite = true;
+  private depth = 0;
 
   constructor(file: string, opts: DbOptions = {}) {
     this.maxBlobs = opts.maxBlobs ?? 200_000;
@@ -104,13 +155,18 @@ export class Db {
     this.sql.close();
   }
 
-  private tx<T>(f: () => T): T {
+  /** Runs `f` in one write transaction. Inside another transaction it just runs, as part of that one. */
+  tx<T>(f: () => T): T {
+    if (this.depth > 0) return f();
     this.sql.exec('BEGIN IMMEDIATE');
+    this.depth++;
     try {
       const r = f();
+      this.depth--;
       this.sql.exec('COMMIT');
       return r;
     } catch (err) {
+      this.depth--;
       this.sql.exec('ROLLBACK');
       throw err;
     }
@@ -118,11 +174,11 @@ export class Db {
 
   // --- accounts
 
-  /** Adds an account (its own pubkey becomes its key), or changes its quota. */
+  /** Adds an account by hand (its own pubkey becomes its key), or sets its quota by hand. A hand-set quota wins. */
   putAccount(pubkey: string, quota: number | null, now: number): void {
     this.tx(() => {
-      this.sql.prepare('INSERT INTO accounts (pubkey, quota, added) VALUES (?, ?, ?) ON CONFLICT(pubkey) DO UPDATE SET quota = excluded.quota')
-        .run(pubkey, quota, now);
+      this.sql.prepare(`INSERT INTO accounts (pubkey, quota, added, hand) VALUES (?, ?, ?, 1)
+        ON CONFLICT(pubkey) DO UPDATE SET quota = excluded.quota, hand = 1`).run(pubkey, quota, now);
       this.sql.prepare('INSERT OR IGNORE INTO keys (key, account) VALUES (?, ?)').run(pubkey, pubkey);
       // a new account may have blobs it let go of before it was removed, still in the bin on its name
       this.recount(pubkey);
@@ -167,8 +223,97 @@ export class Db {
 
   /** The account a key writes for, or null if it may not write here. */
   accountOf(key: string): Account | null {
-    const r = this.sql.prepare(`SELECT ${ACCOUNT_COLS} FROM keys k JOIN accounts a ON a.pubkey = k.account WHERE k.key = ?`).get(key);
+    const r = this.sql.prepare(`SELECT ${ACCOUNT_COLS} FROM keys k JOIN accounts a ON a.pubkey = k.account WHERE k.key = ?
+      AND (a.hand = 1 OR ${this.membersWrite ? 1 : 0})`).get(key);
     return (r as unknown as Account) ?? null;
+  }
+
+  /** An account by its pubkey, whether or not it may write now. */
+  account(pubkey: string): Account | null {
+    return (this.sql.prepare(`SELECT ${ACCOUNT_COLS} FROM accounts a WHERE a.pubkey = ?`).get(pubkey) as unknown as Account) ?? null;
+  }
+
+  // --- the home's member list
+
+  /** Pubkeys the home's member list has, as last applied. */
+  members(): string[] {
+    return this.sql.prepare('SELECT pubkey FROM accounts WHERE member = 1 ORDER BY pubkey').all().map((r) => r.pubkey as string);
+  }
+
+  /** Sets the quota of every account that came only from the home (a hand-set quota is left alone). */
+  setMemberQuota(quota: number): void {
+    this.sql.prepare('UPDATE accounts SET quota = ? WHERE hand = 0').run(quota);
+  }
+
+  /**
+   * Makes `pubkey` a member. A new account gets `quota`; an account added by hand keeps its own. What its keys
+   * owned when it was last removed comes back, where the bin hasn't erased it yet.
+   */
+  joinMember(pubkey: string, quota: number, now: number): void {
+    this.tx(() => {
+      this.sql.prepare(`INSERT INTO accounts (pubkey, quota, added, hand, member) VALUES (?, ?, ?, 0, 1)
+        ON CONFLICT(pubkey) DO UPDATE SET member = 1`).run(pubkey, quota, now);
+      this.sql.prepare('INSERT OR IGNORE INTO keys (key, account) VALUES (?, ?)').run(pubkey, pubkey);
+      const parked = this.sql.prepare('SELECT p.sha256, p.key, p.uploaded, b.size, b.type FROM parked p JOIN blobs b ON b.sha256 = p.sha256 WHERE p.account = ?').all(pubkey);
+      for (const p of parked) {
+        // only keys that still write for this account take their copies back
+        if (this.accountKey(p.key as string) === pubkey) this.ownIn(p.sha256 as string, Number(p.size), p.type as string, p.key as string, Number(p.uploaded));
+      }
+      this.sql.prepare('DELETE FROM parked WHERE account = ?').run(pubkey);
+      this.sql.prepare('DELETE FROM home_removed WHERE pubkey = ?').run(pubkey);
+      this.recount(pubkey);
+    });
+  }
+
+  /**
+   * Takes `pubkey` off the member list. An account added by hand keeps working with its own quota. Otherwise the
+   * account goes: for `removed`, what its keys owned is let go into the bin with the bin clock at `removedAt` (and
+   * parked, so it can come back); for `erased`, what only it holds is erased now. Returns the hashes erased now
+   * (delete their files after the transaction).
+   */
+  leaveMember(r: Removal, now: number): string[] {
+    return this.tx(() => {
+      this.sql.prepare(`INSERT INTO home_removed (pubkey, removed_at, deletes_at, reason, noticed) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(pubkey) DO UPDATE SET removed_at = excluded.removed_at, deletes_at = excluded.deletes_at, reason = excluded.reason`)
+        .run(r.pubkey, r.removedAt, r.deletesAt, r.reason, r.noticed);
+      const acc = this.account(r.pubkey);
+      if (!acc) return [];
+      if (acc.hand) {
+        this.sql.prepare('UPDATE accounts SET member = 0 WHERE pubkey = ?').run(r.pubkey);
+        return [];
+      }
+      if (r.reason === 'erased') return this.purgeAccount(r.pubkey, now) ?? [];
+      const at = Math.min(r.removedAt, now);
+      for (const k of this.sql.prepare('SELECT key FROM keys WHERE account = ?').all(r.pubkey).map((x) => x.key as string)) {
+        for (const o of this.sql.prepare('SELECT sha256, uploaded FROM owners WHERE key = ?').all(k)) {
+          this.sql.prepare('INSERT OR IGNORE INTO parked (account, sha256, key, uploaded) VALUES (?, ?, ?, ?)').run(r.pubkey, o.sha256, k, o.uploaded);
+          this.letGo(o.sha256 as string, k, at);
+        }
+      }
+      this.sql.prepare('DELETE FROM accounts WHERE pubkey = ?').run(r.pubkey);
+      return [];
+    });
+  }
+
+  /** Removals recorded from the home, newest first. */
+  removals(): Removal[] {
+    return this.sql.prepare('SELECT pubkey, removed_at AS removedAt, deletes_at AS deletesAt, reason, noticed FROM home_removed ORDER BY removed_at DESC')
+      .all() as unknown as Removal[];
+  }
+
+  homeState(): HomeState {
+    const r = this.sql.prepare(`SELECT url, last_good AS lastGood, list, last_try AS lastTry, error_kind AS errorKind, error,
+      held, held_since AS heldSince FROM home_state WHERE id = 1`).get();
+    return r as unknown as HomeState;
+  }
+
+  saveHomeState(s: Partial<HomeState>): void {
+    const cols: Record<keyof HomeState, string> = {
+      url: 'url', lastGood: 'last_good', list: 'list', lastTry: 'last_try', errorKind: 'error_kind', error: 'error', held: 'held', heldSince: 'held_since',
+    };
+    const keys = Object.keys(s) as (keyof HomeState)[];
+    if (keys.length === 0) return;
+    this.sql.prepare(`UPDATE home_state SET ${keys.map((k) => `${cols[k]} = ?`).join(', ')} WHERE id = 1`).run(...keys.map((k) => s[k] ?? null));
   }
 
   /** The account a key writes for, by pubkey only. */
