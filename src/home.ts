@@ -13,7 +13,7 @@ import type { ServiceKey } from './servicekey.ts';
 // --- the home's reply, in one place: a field renamed on the home is a one-line change here
 
 const REPLY = {
-  result: 'result', error: 'error', owner: 'owner', members: 'members', removed: 'removed',
+  result: 'result', error: 'error', owner: 'owner', members: 'members', removed: 'removed', admins: 'admins',
   pubkey: 'pubkey', removedAt: 'removedAt', deletesAt: 'deletesAt', reason: 'reason',
 } as const;
 /** What the home says when it doesn't know this storage's key yet (HTTP 401). */
@@ -27,6 +27,8 @@ export interface MemberList {
   owner: string;
   members: string[];
   removed: { pubkey: string; removedAt: number; deletesAt: number | null; reason: 'removed' | 'erased' }[];
+  /** Keys that may use this storage's management page besides the owner. A home that doesn't send it has none. */
+  admins: string[];
 }
 
 export type HomeErrorKind = 'unknown-storage' | 'refused' | 'rate-limited' | 'unreachable' | 'malformed' | 'error';
@@ -77,7 +79,10 @@ export function parseReply(text: string): MemberList {
     const reason: 'removed' | 'erased' = x[REPLY.reason] === 'erased' ? 'erased' : 'removed';
     return { pubkey: hex(x[REPLY.pubkey], 'a removed pubkey'), removedAt, deletesAt: deletesAt ?? null, reason };
   });
-  return { owner, members, removed };
+  const rawAdmins = r[REPLY.admins] ?? [];
+  if (!Array.isArray(rawAdmins)) throw new HomeError('malformed', `${REPLY.admins} is not a list`);
+  const admins = [...new Set((rawAdmins as unknown[]).map((a) => hex(a, 'an admin')))];
+  return { owner, members, removed, admins };
 }
 
 /** The body storage sends, byte for byte (its hash is in the auth). */
@@ -325,6 +330,7 @@ export class Home {
       }
       this.db.saveHomeState({
         lastGood: now, list: JSON.stringify(list), errorKind: null, error: null,
+        homeOwner: list.owner, admins: JSON.stringify(list.admins ?? []), // a list stored by 0.2.0 has no admins
         held: heldJson, heldSince: held.length ? (state.heldSince ?? now) : null,
       });
       return { ok: true as const, joined, left: hold ? 0 : leaving.length, held: held.length };

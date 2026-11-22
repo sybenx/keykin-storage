@@ -50,6 +50,25 @@ export interface HomeState {
   /** Removals held back for `home apply` (JSON array of {pubkey, removedAt, reason}), and since when. */
   held: string | null;
   heldSince: number | null;
+  /** The owner and the admins (JSON array of hex pubkeys) of the last good member list. */
+  homeOwner: string | null;
+  admins: string | null;
+}
+
+/** A blob in the bin, with the account its bytes count against (null when that account is gone). */
+export interface Binned extends Blob {
+  binned: number;
+  charged: string | null;
+}
+
+/** A removed member's files waiting on their return: everything that comes back if they do. */
+export interface Parked {
+  pubkey: string;
+  removedAt: number;
+  reason: 'removed' | 'erased';
+  /** Counted the way quotas count (each blob at least MIN_CHARGE bytes), so this is what comes back on their quota. */
+  bytes: number;
+  blobs: number;
 }
 
 /** Every blob is charged at least this many bytes, so tiny blobs can't use up the disk's inodes for free. */
@@ -98,6 +117,35 @@ const MIGRATIONS: ((db: Db) => void)[] = [
       id INTEGER PRIMARY KEY CHECK (id = 1), url TEXT, last_good INTEGER, list TEXT, last_try INTEGER, error_kind TEXT,
       error TEXT, held TEXT, held_since INTEGER);
     INSERT INTO home_state (id) VALUES (1);`),
+  // 0.3.0: what is stored in all, kept by triggers on every insert and delete, so the management page reads one row
+  (db) => db.sql.exec(`
+    CREATE TABLE totals (id INTEGER PRIMARY KEY CHECK (id = 1), bytes INTEGER NOT NULL, blobs INTEGER NOT NULL);
+    INSERT INTO totals (id, bytes, blobs) SELECT 1, COALESCE(SUM(size), 0), COUNT(*) FROM blobs;
+    CREATE TRIGGER totals_in AFTER INSERT ON blobs BEGIN
+      UPDATE totals SET bytes = bytes + NEW.size, blobs = blobs + 1 WHERE id = 1; END;
+    CREATE TRIGGER totals_out AFTER DELETE ON blobs BEGIN
+      UPDATE totals SET bytes = bytes - OLD.size, blobs = blobs - 1 WHERE id = 1; END;`),
+  // 0.3.0: totals of each removed member's parked files, set when they are parked and lowered by a trigger when a
+  // blob row goes (the bin, an erase), before the cascade takes the parked rows with it
+  (db) => {
+    db.sql.exec(`
+      ALTER TABLE home_removed ADD COLUMN bytes INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE home_removed ADD COLUMN blobs INTEGER NOT NULL DEFAULT 0;
+      CREATE TRIGGER parked_out BEFORE DELETE ON blobs BEGIN
+        UPDATE home_removed SET bytes = bytes - MAX(OLD.size, ${MIN_CHARGE}), blobs = blobs - 1
+          WHERE pubkey IN (SELECT account FROM parked WHERE sha256 = OLD.sha256); END;`);
+    for (const r of db.sql.prepare('SELECT pubkey FROM home_removed').all()) db.recountParked(r.pubkey as string);
+  },
+  // 0.3.0: the home's owner and admins, kept with the last good member list
+  (db) => {
+    db.sql.exec('ALTER TABLE home_state ADD COLUMN home_owner TEXT; ALTER TABLE home_state ADD COLUMN admins TEXT;');
+    const list = db.sql.prepare('SELECT list FROM home_state WHERE id = 1').get()?.list;
+    let owner: unknown = null;
+    try {
+      owner = typeof list === 'string' ? JSON.parse(list)?.owner : null;
+    } catch {}
+    if (typeof owner === 'string' && /^[0-9a-f]{64}$/.test(owner)) db.sql.prepare('UPDATE home_state SET home_owner = ? WHERE id = 1').run(owner);
+  },
 ];
 
 export interface Owned extends Blob {
@@ -290,9 +338,22 @@ export class Db {
           this.letGo(o.sha256 as string, k, at);
         }
       }
+      this.recountParked(r.pubkey);
       this.sql.prepare('DELETE FROM accounts WHERE pubkey = ?').run(r.pubkey);
       return [];
     });
+  }
+
+  /** Sets a removed member's parked totals from a full count of their parked rows. */
+  recountParked(pubkey: string): void {
+    this.sql.prepare(`UPDATE home_removed SET (bytes, blobs) = (SELECT COALESCE(SUM(MAX(size, ${MIN_CHARGE})), 0), COUNT(*)
+      FROM blobs WHERE sha256 IN (SELECT sha256 FROM parked WHERE account = ?)) WHERE pubkey = ?`).run(pubkey, pubkey);
+  }
+
+  /** Removed members with parked files, removed after `since`, newest first. */
+  parked(since: number): Parked[] {
+    return this.sql.prepare(`SELECT pubkey, removed_at AS removedAt, reason, bytes, blobs FROM home_removed
+      WHERE blobs > 0 AND removed_at > ? ORDER BY removed_at DESC`).all(since) as unknown as Parked[];
   }
 
   /** Removals recorded from the home, newest first. */
@@ -303,17 +364,29 @@ export class Db {
 
   homeState(): HomeState {
     const r = this.sql.prepare(`SELECT url, last_good AS lastGood, list, last_try AS lastTry, error_kind AS errorKind, error,
-      held, held_since AS heldSince FROM home_state WHERE id = 1`).get();
+      held, held_since AS heldSince, home_owner AS homeOwner, admins FROM home_state WHERE id = 1`).get();
     return r as unknown as HomeState;
   }
 
   saveHomeState(s: Partial<HomeState>): void {
     const cols: Record<keyof HomeState, string> = {
       url: 'url', lastGood: 'last_good', list: 'list', lastTry: 'last_try', errorKind: 'error_kind', error: 'error', held: 'held', heldSince: 'held_since',
+      homeOwner: 'home_owner', admins: 'admins',
     };
     const keys = Object.keys(s) as (keyof HomeState)[];
     if (keys.length === 0) return;
     this.sql.prepare(`UPDATE home_state SET ${keys.map((k) => `${cols[k]} = ?`).join(', ')} WHERE id = 1`).run(...keys.map((k) => s[k] ?? null));
+  }
+
+  /** The owner and admins of the last good member list (none before the first one, or from a home without admins). */
+  homeRoles(): { owner: string | null; admins: string[] } {
+    const r = this.sql.prepare('SELECT home_owner AS owner, admins FROM home_state WHERE id = 1').get();
+    let admins: string[] = [];
+    try {
+      const a = typeof r?.admins === 'string' ? JSON.parse(r.admins) : [];
+      if (Array.isArray(a)) admins = a.filter((x): x is string => typeof x === 'string');
+    } catch {}
+    return { owner: (r?.owner as string) ?? null, admins };
   }
 
   /** The account a key writes for, by pubkey only. */
@@ -470,8 +543,36 @@ export class Db {
 
   // --- the bin
 
-  binned(): Blob[] {
-    return this.sql.prepare('SELECT sha256, size, type, created, binned FROM blobs WHERE binned IS NOT NULL ORDER BY binned DESC').all() as unknown as Blob[];
+  /**
+   * Blobs in the bin, newest first, at most `limit` (all when not given), with the account each is charged to. Reads
+   * the bin's index, not every blob.
+   */
+  binned(limit = -1): Binned[] {
+    return this.sql.prepare(`SELECT b.sha256, b.size, b.type, b.created, b.binned, a.pubkey AS charged FROM blobs b
+      LEFT JOIN accounts a ON a.pubkey = b.binned_by WHERE b.binned IS NOT NULL ORDER BY b.binned DESC LIMIT ?`).all(limit) as unknown as Binned[];
+  }
+
+  /** Every blob stored, binned ones included: their real bytes and how many. Kept by triggers, so one row read. */
+  totals(): { bytes: number; blobs: number } {
+    const r = this.sql.prepare('SELECT bytes, blobs FROM totals WHERE id = 1').get()!;
+    return { bytes: Number(r.bytes), blobs: Number(r.blobs) };
+  }
+
+  /**
+   * Takes a blob out of the bin. It goes back to `key` when given; otherwise to the account it is charged to, which
+   * costs that account nothing more, or to `fallback` (the box owner) when that account is gone. Returns the key it
+   * went back to, or null when the blob is not in the bin. Throws when there is nobody to give it to.
+   */
+  restore(sha256: string, now: number, to: { key?: string; fallback: string | null }): string | null {
+    return this.tx(() => {
+      const b = this.blob(sha256);
+      if (!b || b.binned === null) return null;
+      const by = this.binnedBy(sha256);
+      const key = to.key ?? (by !== null && this.account(by) ? by : to.fallback);
+      if (!key) throw new Error('give the owner to restore it to');
+      this.ownIn(b.sha256, b.size, b.type, key, now);
+      return key;
+    });
   }
 
   /** Blobs in the bin since before `before`. */

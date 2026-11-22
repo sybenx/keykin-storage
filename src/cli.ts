@@ -4,7 +4,7 @@
 //   node src/cli.ts add <npub|hex> <quota: 10G, 500M, unlimited>
 //   node src/cli.ts remove <npub|hex> [--purge]
 //   node src/cli.ts bin
-//   node src/cli.ts restore <sha256> [<npub|hex> owner, default the box owner]
+//   node src/cli.ts restore <sha256> [<npub|hex> owner, default the account it is charged to, else the box owner]
 //   node src/cli.ts erase <sha256>
 //   node src/cli.ts home status | key | sync | apply
 //
@@ -135,11 +135,10 @@ try {
       for (const x of db.binned()) console.log(`${x.sha256}  ${size(x.size)}  binned ${new Date(x.binned! * 1000).toISOString()}`);
       break;
     case 'restore': {
-      const x = db.blob(a ?? '');
-      if (!x || x.binned === null) throw new Error('that blob is not in the bin');
-      const owner = b ? pk(b) : db.accounts().find((acc) => acc.quota === null)?.pubkey;
-      if (!owner) throw new Error('give the owner to restore it to');
-      db.own(x.sha256, x.size, x.type, owner, now);
+      const owner = db.restore((a ?? '').toLowerCase(), now, {
+        key: b ? pk(b) : undefined, fallback: db.accounts().find((acc) => acc.quota === null)?.pubkey ?? null,
+      });
+      if (!owner) throw new Error('that blob is not in the bin');
       console.log(`restored to ${npub(owner)}`);
       break;
     }
