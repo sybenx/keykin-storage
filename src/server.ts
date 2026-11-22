@@ -3,13 +3,14 @@
 // Writes come only from keys of accounts on this box. Reads are open. Nothing is deleted on a timer except blobs
 // that sat in the bin (owned by nobody) for binDays.
 
+import { randomBytes } from 'node:crypto';
 import { createReadStream, statfsSync } from 'node:fs';
 import http from 'node:http';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { checkAuth, parseAuth, type Auth, type Verb } from './auth.ts';
 import type { Config } from './config.ts';
-import { Db, type Account, type Blob, type Pending } from './db.ts';
+import { Db, type Account, type Blob, type Pending, type Upload } from './db.ts';
 import { Home, httpHome, type HomeSource } from './home.ts';
 import { clientAddress, RateLimit } from './limit.ts';
 import { isManagePath, manager, send } from './manage.ts';
@@ -18,6 +19,8 @@ import { serviceKey, type ServiceKey } from './servicekey.ts';
 import { Aborted, Store, TooLarge, TooSlow, type MinRate, type Received } from './store.ts';
 
 const SHA_PATH = /^\/([0-9a-fA-F]{64})(\.[A-Za-z0-9]{1,10})?$/;
+const UPLOADS_PATH = /^\/uploads\/([^/]+)(?:\/([^/]+))?$/;
+const UPLOAD_ID = /^[0-9a-f]{32}$/;
 const LIST_PATH = /^\/list\/([0-9a-fA-F]{64})$/;
 const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}$/;
 const EXT: Record<string, string> = {
@@ -32,6 +35,12 @@ const MAX_IN_FLIGHT_PER_ACCOUNT = 4;
 const DISK_MARGIN = 1024 ** 3;
 /** An upload averaging under this many bytes a second over a minute is cut off, so it can't hold a slot forever. */
 const MIN_RATE = 16 * 1024;
+/** An upload in pieces that gets no new piece for this long, seconds, is discarded. */
+export const UPLOAD_IDLE = DAY;
+/** Most pieces one upload may have, so its status stays small. */
+export const MAX_PIECES = 4096;
+/** The one answer for an upload id that is unknown, someone else's or expired, so ids can't be probed. */
+const NO_UPLOAD = 'no such upload';
 
 function freeBytes(dir: string): number | null {
   try {
@@ -56,6 +65,8 @@ export interface Running {
   url: string;
   /** Erases blobs whose time in the bin is up. Runs hourly by itself; exposed for tests. */
   sweep(): number;
+  /** Discards uploads in pieces that got nothing for a day, and stray upload files. Runs every minute; exposed for tests. */
+  sweepUploads(): number;
   /** This storage's own key (public half shown at start and by `home key`). */
   serviceKey: ServiceKey;
   /** Follows the home's member list, when STORAGE_HOME_URL is set and the box is set up. */
@@ -85,6 +96,47 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
     : null;
   if (home) db.saveHomeState({ url: config.homeUrl });
 
+  const pieceBytes = config.pieceBytes ?? 8 * 1024 * 1024;
+  /** Largest file in pieces. */
+  const largest = Math.min(config.maxBlobBytes, pieceBytes * MAX_PIECES);
+  const maxOpenPer = config.maxOpenUploadsPerAccount ?? 2;
+  const maxOpen = config.maxOpenUploads ?? 32;
+  /** Uploads touched after this are open. */
+  const live = () => now() - UPLOAD_IDLE;
+  /** Pieces being written now, by `<id>/<index>`: a new write of the same piece stops the old one first. */
+  const writing = new Map<string, { abort(): void; done: Promise<unknown> }>();
+  /** Completions running now, by upload id: a second `complete` waits for the first and gets the same answer. */
+  const completing = new Map<string, Promise<{ status: number; body: unknown }>>();
+  /** Fires on close, so a completion stops hashing. */
+  const closing = new AbortController();
+  const busy = (id: string) => completing.has(id) || [...writing.keys()].some((k) => k.startsWith(id + '/'));
+  const stopWrites = (id: string) => {
+    for (const [k, w] of writing) if (k.startsWith(id + '/')) w.abort();
+  };
+
+  /**
+   * Discards uploads that got no piece for UPLOAD_IDLE (not one being completed), and upload files with no row (their
+   * account was removed, or the CLI took it away). Returns how many uploads it discarded.
+   */
+  const sweepUploads = (): number => {
+    let n = 0;
+    for (const id of db.expiredUploads(live())) {
+      if (completing.has(id)) continue;
+      stopWrites(id);
+      if (db.dropUpload(id)) n++;
+      store.dropUpload(id);
+    }
+    for (const id of store.uploadIds()) {
+      if (!db.upload(id) && !busy(id)) store.dropUpload(id);
+    }
+    return n;
+  };
+  // after a restart: an upload whose file is gone or the wrong length can't be finished
+  for (const u of db.uploads()) {
+    if (store.uploadSize(u.id) !== u.size) db.dropUpload(u.id);
+  }
+  sweepUploads();
+
   const sweep = (): number => {
     const before = now() - config.binDays * DAY;
     let n = 0;
@@ -113,22 +165,34 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
   // minimum rate over a minute is cut off (receive), and the small /mirror body has a deadline (readSmall)
   server.headersTimeout = 60_000;
 
-  // uploads and mirrors in flight: a cap per account and overall, and their declared bytes count against quota
-  const flight = { all: 0, by: new Map<string, { n: number; bytes: number }>() };
-  /** Takes an upload slot. `grow(n)` reserves n bytes of disk and quota for it; `release()` gives all back. */
-  const take = (account: Account): { grow(n: number): void; release(): void } => {
-    const f = flight.by.get(account.pubkey) ?? { n: 0, bytes: 0 };
+  // Uploads, mirrors, pieces and completions in flight: a cap per account and overall. The declared bytes of uploads
+  // and mirrors count against quota and disk; so do open uploads in pieces (kept in the database), until they finish.
+  const flight = { all: 0, by: new Map<string, { n: number; blobs: number; bytes: number }>() };
+  /** Throws 507 unless `n` more bytes leave the disk margin free, with everything in flight and open held back. */
+  const diskRoom = (n: number) => {
+    const free = freeBytes(config.dataDir);
+    if (free === null) return;
+    let reserved = db.openAll(live()).remaining;
+    for (const v of flight.by.values()) reserved += v.bytes;
+    if (free - reserved - n < (config.diskMarginBytes ?? DISK_MARGIN)) throw new HttpError(507, 'this box is out of disk space');
+  };
+  /**
+   * Takes an upload slot. `grow(n)` reserves n bytes of disk and quota for it; `release()` gives all back. A slot for
+   * a piece or a completion (`blob: false`) counts toward the caps on requests at once, but not as a blob to come: its
+   * upload in pieces already holds that back.
+   */
+  const take = (account: Account, opts: { blob?: boolean } = {}): { grow(n: number): void; release(): void } => {
+    const f = flight.by.get(account.pubkey) ?? { n: 0, blobs: 0, bytes: 0 };
     if (flight.all >= MAX_IN_FLIGHT || f.n >= MAX_IN_FLIGHT_PER_ACCOUNT) throw new HttpError(429, 'too many uploads at once');
+    const blob = opts.blob !== false ? 1 : 0;
     f.n++;
+    f.blobs += blob;
     flight.all++;
     flight.by.set(account.pubkey, f);
     let mine = 0, done = false;
     return {
       grow(n: number) {
-        const free = freeBytes(config.dataDir);
-        let reserved = 0;
-        for (const v of flight.by.values()) reserved += v.bytes;
-        if (free !== null && free - reserved - n < (config.diskMarginBytes ?? DISK_MARGIN)) throw new HttpError(507, 'this box is out of disk space');
+        diskRoom(n);
         mine += n;
         f.bytes += n;
       },
@@ -136,15 +200,18 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
         if (done) return;
         done = true;
         f.n--;
+        f.blobs -= blob;
         f.bytes -= mine;
         flight.all--;
         if (f.n === 0) flight.by.delete(account.pubkey);
       },
     };
   };
-  const pending = (account: Account): Pending => {
+  /** What the account has coming: uploads in flight, and open uploads in pieces (but `except`). */
+  const pending = (account: Account, except: string | null = null): Pending => {
     const f = flight.by.get(account.pubkey);
-    return { bytes: f?.bytes ?? 0, n: f?.n ?? 0 };
+    const open = db.openFor(account.pubkey, live(), except);
+    return { bytes: (f?.bytes ?? 0) + open.bytes, n: (f?.blobs ?? 0) + open.n };
   };
   /** Throws 413 unless one of the x tags fits (a blob already charged to the account always does). */
   const mustFit = (account: Account, xs: string[], size: number) => {
@@ -159,6 +226,8 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
   const timer = setInterval(sweep, 3600_000);
   timer.unref();
   sweep();
+  const uploadTimer = setInterval(sweepUploads, 60_000);
+  uploadTimer.unref();
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     cors(res);
@@ -183,6 +252,15 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
     if (path === '/upload' && method === 'PUT') return upload(req, res);
     if (path === '/upload' && method === 'HEAD') return preflight(req, res);
     if (path === '/mirror' && method === 'PUT') return mirror(req, res);
+    if (path === '/uploads' && method === 'POST') return startUpload(req, res);
+    const up = UPLOADS_PATH.exec(path);
+    if (up) {
+      const [, id, part] = up;
+      if (part === undefined && method === 'GET') return uploadStatus(req, res, id);
+      if (part === undefined && method === 'DELETE') return abandon(req, res, id);
+      if (part === 'complete' && method === 'POST') return complete(req, res, id);
+      if (part !== undefined && method === 'PUT') return piece(req, res, id, part);
+    }
     const list = LIST_PATH.exec(path);
     if (list && method === 'GET') return listBlobs(req, res, list[1].toLowerCase());
     const blob = SHA_PATH.exec(path);
@@ -408,6 +486,221 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
     finish(res, got, contentType(type), auth);
   }
 
+  // --- uploads in pieces
+
+  const piecesOf = (u: Upload) => Math.ceil(u.size / u.pieceSize);
+  const pieceLength = (u: Upload, i: number) => (i < piecesOf(u) - 1 ? u.pieceSize : u.size - (piecesOf(u) - 1) * u.pieceSize);
+  const statusOf = (u: Upload) => ({
+    id: u.id, sha256: u.sha256, size: u.size, pieceSize: u.pieceSize, pieces: piecesOf(u), received: db.pieces(u.id),
+    expiresAt: u.touched + UPLOAD_IDLE,
+  });
+
+  /** POST /uploads: {sha256, size, type}. Opens an upload in pieces, or answers with the one already open. */
+  async function startUpload(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    res.setHeader('connection', 'close'); // a refused start's body isn't read
+    const { auth, account } = await writer(req, 'upload');
+    const shape = 'body must be {"sha256": "<hex>", "size": <bytes>, "type": "<mime type>" or null}';
+    let body: any;
+    try {
+      body = JSON.parse((await readSmall(req, 4096, config.mirrorBodyTimeoutMs ?? 10_000)).toString('utf8'));
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      throw new HttpError(400, shape);
+    }
+    if (!body || typeof body !== 'object') throw new HttpError(400, shape);
+    res.removeHeader('connection'); // the body is read
+    const sha = typeof body.sha256 === 'string' ? body.sha256.toLowerCase() : '';
+    if (!/^[0-9a-f]{64}$/.test(sha)) throw new HttpError(400, 'sha256 must be 64 hex characters');
+    const size = body.size;
+    if (!Number.isSafeInteger(size) || size < 1) throw new HttpError(400, 'size must be a whole number of bytes, at least 1');
+    if (body.type !== undefined && body.type !== null && typeof body.type !== 'string') throw new HttpError(400, 'type must be a string or null');
+    if (!auth.xs.includes(sha)) throw new HttpError(403, 'sha256 is not in the authorization');
+    if (size > largest) throw new HttpError(413, `files here are at most ${largest} bytes`);
+
+    // already this account's: nothing to send (only then: anyone can know a hash)
+    if (db.holds(account.pubkey, sha) && store.has(sha)) {
+      const b = db.blob(sha)!;
+      db.own(b.sha256, b.size, b.type, auth.pubkey, now());
+      // an upload of it left open (it came another way meanwhile) would only hold quota back
+      const stale = db.uploadOf(account.pubkey, sha, live());
+      if (stale && !completing.has(stale.id)) {
+        stopWrites(stale.id);
+        db.dropUpload(stale.id);
+        store.dropUpload(stale.id);
+      }
+      return json(res, 200, descriptor(b, db.uploadedAt(b.sha256, auth.pubkey) ?? now()));
+    }
+    sweepUploads(); // an expired upload of this blob would be in the way
+    const open = db.uploadOf(account.pubkey, sha, live());
+    if (open) {
+      if (open.size !== size) {
+        throw new HttpError(409, `an upload of this sha256 with another size (${open.size} bytes) is open; cancel it (DELETE /uploads/${open.id}) first`);
+      }
+      return json(res, 200, statusOf(open));
+    }
+
+    const at = now();
+    const r = db.openUpload(auth.pubkey, { id: randomBytes(16).toString('hex'), sha256: sha, size, type: contentType(body.type), pieceSize: pieceBytes, created: at, touched: at }, (a) => {
+      if (db.openFor(a.pubkey, live()).n >= maxOpenPer) {
+        return { status: 429, reason: `you have ${maxOpenPer} uploads open here, the most at once; finish or cancel one first` };
+      }
+      if (db.openAll(live()).n >= maxOpen) return { status: 429, reason: 'this box has too many uploads open; try again later' };
+      const why = db.refusal(a, sha, size, pending(a));
+      if (why) return { status: 413, reason: why };
+      try {
+        diskRoom(size);
+      } catch (err) {
+        return { status: 507, reason: (err as Error).message };
+      }
+      return null;
+    });
+    if (!r.ok) throw new HttpError(r.status, r.reason);
+    try {
+      store.createUpload(r.upload.id, size);
+    } catch (err) {
+      db.dropUpload(r.upload.id);
+      throw err;
+    }
+    json(res, 201, statusOf(r.upload));
+  }
+
+  /** The caller's account and its open upload `id`, or the one 404 for anything else. */
+  async function mine(req: http.IncomingMessage, id: string): Promise<{ auth: Auth; account: Account; u: Upload }> {
+    const { auth, account } = await writer(req, 'upload');
+    const u = UPLOAD_ID.test(id) ? db.upload(id) : null;
+    if (!u || u.account !== account.pubkey || u.touched <= live()) throw new HttpError(404, NO_UPLOAD);
+    if (!auth.xs.includes(u.sha256)) throw new HttpError(401, 'authorization must name the upload\'s sha256 in an x tag');
+    return { auth, account, u };
+  }
+
+  async function uploadStatus(req: http.IncomingMessage, res: http.ServerResponse, id: string): Promise<void> {
+    const { u } = await mine(req, id);
+    json(res, 200, statusOf(u));
+  }
+
+  /** PUT /uploads/<id>/<index>: one piece, streamed into its place. Sending a piece again replaces it. */
+  async function piece(req: http.IncomingMessage, res: http.ServerResponse, id: string, part: string): Promise<void> {
+    res.setHeader('connection', 'close'); // a refused piece's body isn't read
+    const { account, u } = await mine(req, id);
+    if (!/^\d{1,9}$/.test(part)) throw new HttpError(400, 'the piece number must be a whole number');
+    const index = Number(part);
+    if (index >= piecesOf(u)) throw new HttpError(400, `this upload has pieces 0 to ${piecesOf(u) - 1}`);
+    const expected = pieceLength(u, index);
+    const len = req.headers['content-length'];
+    if (!len || !/^\d+$/.test(len)) throw new HttpError(411, 'content-length required');
+    if (Number(len) !== expected) throw new HttpError(400, `piece ${index} must be ${expected} bytes`);
+    const claimed = header(req, 'x-piece-sha256')?.toLowerCase() ?? null;
+    if (claimed !== null && !/^[0-9a-f]{64}$/.test(claimed)) throw new HttpError(400, 'x-piece-sha256 must be 64 hex characters');
+    if (completing.has(u.id)) throw new HttpError(409, 'this upload is being completed');
+
+    const slot = take(account, { blob: false });
+    let got: { sha256: string; size: number };
+    try {
+      // the same piece sent again while the first copy is still arriving (the phone gave up on it): the new one wins
+      const k = `${u.id}/${index}`;
+      for (let w = writing.get(k); w; w = writing.get(k)) {
+        w.abort();
+        await w.done.catch(() => {});
+      }
+      if (completing.has(u.id)) throw new HttpError(409, 'this upload is being completed');
+      if (!db.upload(u.id)) throw new HttpError(404, NO_UPLOAD);
+      db.unmarkPiece(u.id, index); // its bytes are about to change
+      const stop = new AbortController();
+      const done = store.writePiece(u.id, index * u.pieceSize, req, expected, {
+        windowMs: config.uploadWindowMs ?? 60_000, bytesPerSecond: config.minUploadBytesPerSecond ?? MIN_RATE, expected,
+      }, stop.signal);
+      const w = { abort: () => stop.abort(), done };
+      writing.set(k, w);
+      try {
+        got = await done;
+      } catch (err) {
+        if (err instanceof TooLarge) throw new HttpError(400, `piece ${index} must be ${expected} bytes`);
+        if (err instanceof Aborted) throw new HttpError(400, 'upload aborted');
+        if (err instanceof TooSlow) throw new HttpError(408, 'upload too slow: under 16 KiB a second for a minute');
+        throw err;
+      } finally {
+        if (writing.get(k) === w) writing.delete(k);
+      }
+    } finally {
+      slot.release();
+    }
+    res.removeHeader('connection'); // the body is read: the connection can carry the next piece
+    if (got.size !== expected) throw new HttpError(400, `piece ${index} must be ${expected} bytes`);
+    if (claimed !== null && got.sha256 !== claimed) throw new HttpError(400, 'piece does not match x-piece-sha256');
+    if (!db.markPiece(u.id, index, expected, now())) throw new HttpError(404, NO_UPLOAD);
+    json(res, 200, statusOf(db.upload(u.id)!));
+  }
+
+  /**
+   * POST /uploads/<id>/complete: with every piece here, hashes the whole file and stores it as an upload would. A
+   * second call while the first runs (the phone lost the answer) waits for the same answer.
+   */
+  async function complete(req: http.IncomingMessage, res: http.ServerResponse, id: string): Promise<void> {
+    const { auth, account, u } = await mine(req, id);
+    let p = completing.get(u.id);
+    if (!p) {
+      p = completeNow(u, auth, account);
+      completing.set(u.id, p);
+      p.catch(() => {}).finally(() => completing.delete(u.id));
+    }
+    const r = await p;
+    json(res, r.status, r.body);
+  }
+
+  async function completeNow(u: Upload, auth: Auth, account: Account): Promise<{ status: number; body: unknown }> {
+    const have = db.pieceCount(u.id);
+    if (have < piecesOf(u)) {
+      throw new HttpError(400, `${piecesOf(u) - have} of ${piecesOf(u)} pieces are missing; ask for the status and send them`);
+    }
+    const discard = () => {
+      stopWrites(u.id);
+      db.dropUpload(u.id);
+      store.dropUpload(u.id);
+    };
+    const slot = take(account, { blob: false });
+    let sha: string;
+    try {
+      sha = await store.hashUpload(u.id, closing.signal);
+    } catch (err) {
+      if (closing.signal.aborted) throw new HttpError(503, 'this box is restarting; try again');
+      throw err;
+    } finally {
+      slot.release();
+    }
+    if (sha !== u.sha256) {
+      discard();
+      throw new HttpError(409, 'the pieces do not make the promised sha256; the upload is discarded, start over');
+    }
+    let placedNew = false;
+    let r: ReturnType<Db['ownAsWriter']>;
+    try {
+      r = db.ownAsWriter(u.sha256, u.size, u.type, auth.pubkey, now(), (a) => pending(a, u.id), () => {
+        if (!db.dropUpload(u.id)) throw new HttpError(404, NO_UPLOAD); // taken away while it was hashed
+        placedNew = !store.has(u.sha256);
+        store.commit({ tmp: store.uploadPath(u.id), sha256: u.sha256, size: u.size });
+      });
+    } catch (err) {
+      if (placedNew) store.remove(u.sha256); // no row, no file
+      discard();
+      throw err;
+    }
+    if (!r.ok) {
+      discard();
+      throw new HttpError(r.status, r.reason);
+    }
+    return { status: r.isNew ? 201 : 200, body: descriptor(db.blob(u.sha256)!, db.uploadedAt(u.sha256, auth.pubkey) ?? now()) };
+  }
+
+  /** DELETE /uploads/<id>: abandons it, and gives back what it held. */
+  async function abandon(req: http.IncomingMessage, res: http.ServerResponse, id: string): Promise<void> {
+    const { u } = await mine(req, id);
+    if (completing.has(u.id)) throw new HttpError(409, 'this upload is being completed');
+    stopWrites(u.id);
+    db.dropUpload(u.id);
+    store.dropUpload(u.id);
+    end(res, 204);
+  }
+
   // --- BUD-12
 
   function listBlobs(req: http.IncomingMessage, res: http.ServerResponse, pubkey: string): void {
@@ -450,20 +743,23 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
     db,
     url: `http://${config.host === '0.0.0.0' ? '127.0.0.1' : config.host}:${port}`,
     sweep,
+    sweepUploads,
     serviceKey: key,
     home,
     close: async () => {
       // safe to call twice: the second call waits for the first
       closed ??= (async () => {
         await home?.stop();
+        closing.abort();
+        clearInterval(uploadTimer);
         await new Promise<void>((resolve) => {
           clearInterval(timer);
           server.closeAllConnections();
-          server.close(() => {
-            db.close();
-            resolve();
-          });
+          server.close(() => resolve());
         });
+        // pieces and completions cut off above settle first, so none of them reaches a closed database
+        await Promise.allSettled([...[...writing.values()].map((w) => w.done), ...completing.values()]);
+        db.close();
       })();
       return closed;
     },
