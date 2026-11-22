@@ -21,6 +21,11 @@ export interface Config {
   binDays: number;
   /** Mirror fetch timeout, ms. */
   mirrorTimeoutMs: number;
+  /** Whether requests come through Cloudflare, so CF-Connecting-IP names the client. Otherwise the socket does. */
+  behindCloudflare: boolean;
+  /** Signed requests an address may send at once, and per second after that. Defaults 60 and 10. */
+  authBurst?: number;
+  authPerSecond?: number;
   /** Tests only: uploads stop when the disk would have less than this left. Default 1 GiB. */
   diskMarginBytes?: number;
   /** Tests only: let /mirror fetch from loopback and private addresses. */
@@ -30,6 +35,14 @@ export interface Config {
 }
 
 const MiB = 1024 * 1024;
+
+/** A yes/no setting: true, yes, 1 or false, no, 0 (empty is no). Anything else is an error naming the setting. */
+function flag(env: NodeJS.ProcessEnv, name: string): boolean {
+  const v = (env[name] ?? '').trim().toLowerCase();
+  if (['', 'false', 'no', '0'].includes(v)) return false;
+  if (['true', 'yes', '1'].includes(v)) return true;
+  throw new Error(`${name} must be true or false`);
+}
 
 /**
  * Reads the settings. A box installed before it's set up (no STORAGE_PUBLIC_URL or STORAGE_OWNER) still starts:
@@ -57,5 +70,6 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     maxBlobsPerAccount: Number(env.STORAGE_MAX_BLOBS || 200_000),
     binDays: Number(env.STORAGE_BIN_DAYS || 30),
     mirrorTimeoutMs: Number(env.STORAGE_MIRROR_TIMEOUT_S || 120) * 1000,
+    behindCloudflare: flag(env, 'STORAGE_BEHIND_CLOUDFLARE'),
   };
 }

@@ -6,9 +6,10 @@ import { createReadStream, statfsSync } from 'node:fs';
 import http from 'node:http';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
-import { readAuth, type Auth, type Verb } from './auth.ts';
+import { checkAuth, parseAuth, type Auth, type Verb } from './auth.ts';
 import type { Config } from './config.ts';
 import { Db, type Account, type Blob, type Pending } from './db.ts';
+import { clientAddress, RateLimit } from './limit.ts';
 import { guardedFetch, MirrorError } from './mirror.ts';
 import { Aborted, Store, TooLarge, type Received } from './store.ts';
 
@@ -126,6 +127,8 @@ export async function start(config: Config): Promise<Running> {
     throw new HttpError(413, why!);
   };
 
+  const limit = new RateLimit({ burst: config.authBurst ?? 60, perSecond: config.authPerSecond ?? 10 });
+
   const timer = setInterval(sweep, 3600_000);
   timer.unref();
   sweep();
@@ -135,6 +138,9 @@ export async function start(config: Config): Promise<Running> {
     const method = req.method ?? 'GET';
     const path = new URL(req.url ?? '/', 'http://x').pathname;
     if (method === 'OPTIONS') return end(res, 204);
+    if (req.headers.authorization !== undefined && !limit.take(clientAddress(req, config.behindCloudflare))) {
+      return fail(res, 429, 'too many signed requests from your address; wait a few seconds', method === 'HEAD');
+    }
     if (!ready && method !== 'GET' && method !== 'HEAD') {
       return fail(res, 503, 'this box is not set up yet: set STORAGE_PUBLIC_URL and STORAGE_OWNER');
     }
@@ -159,11 +165,18 @@ export async function start(config: Config): Promise<Running> {
   // --- auth
 
   function writer(req: http.IncomingMessage, verb: Verb): { auth: Auth; account: Account } {
-    const r = readAuth(req.headers.authorization, verb, config.domains, now());
-    if (!r.ok) throw new HttpError(r.status, r.reason);
-    const account = db.accountOf(r.auth.pubkey);
+    const p = parseAuth(req.headers.authorization);
+    if (!p.ok) throw new HttpError(p.status, p.reason);
+    // a key with no account here is refused before its signature is checked: strangers cost one lookup
+    const account = db.accountOf(p.event.pubkey);
     if (!account) throw new HttpError(403, 'this key may not write here');
-    return { auth: r.auth, account };
+    return { auth: verified(p.event, verb), account };
+  }
+
+  function verified(event: Parameters<typeof checkAuth>[0], verb: Verb): Auth {
+    const r = checkAuth(event, verb, config.domains, now());
+    if (!r.ok) throw new HttpError(r.status, r.reason);
+    return r.auth;
   }
 
   // --- BUD-01
@@ -350,9 +363,10 @@ export async function start(config: Config): Promise<Running> {
   // --- BUD-12
 
   function listBlobs(req: http.IncomingMessage, res: http.ServerResponse, pubkey: string): void {
-    const r = readAuth(req.headers.authorization, 'list', config.domains, now());
-    if (!r.ok) throw new HttpError(r.status, r.reason);
-    if (r.auth.pubkey !== pubkey) throw new HttpError(403, 'you can only list your own blobs');
+    const p = parseAuth(req.headers.authorization);
+    if (!p.ok) throw new HttpError(p.status, p.reason);
+    if (p.event.pubkey !== pubkey) throw new HttpError(403, 'you can only list your own blobs');
+    verified(p.event, 'list');
     const q = new URL(req.url ?? '/', 'http://x').searchParams;
     const cursor = q.get('cursor')?.toLowerCase() ?? null;
     if (cursor && !/^[0-9a-f]{64}$/.test(cursor)) throw new HttpError(400, 'cursor is not a sha256');
@@ -362,10 +376,12 @@ export async function start(config: Config): Promise<Running> {
 
   function del(req: http.IncomingMessage, res: http.ServerResponse, sha: string): void {
     // any key that holds a copy may let go of it, even one whose account was removed
-    const r = readAuth(req.headers.authorization, 'delete', config.domains, now());
-    if (!r.ok) throw new HttpError(r.status, r.reason);
-    if (!r.auth.xs.includes(sha)) throw new HttpError(401, 'delete authorization must name this blob in an x tag');
-    if (!db.disown(sha, r.auth.pubkey, now())) throw new HttpError(404, 'you hold no copy of this blob');
+    const p = parseAuth(req.headers.authorization);
+    if (!p.ok) throw new HttpError(p.status, p.reason);
+    if (db.uploadedAt(sha, p.event.pubkey) === null) throw new HttpError(404, 'you hold no copy of this blob');
+    const a = verified(p.event, 'delete');
+    if (!a.xs.includes(sha)) throw new HttpError(401, 'delete authorization must name this blob in an x tag');
+    if (!db.disown(sha, a.pubkey, now())) throw new HttpError(404, 'you hold no copy of this blob');
     end(res, 204);
   }
 

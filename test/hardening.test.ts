@@ -127,3 +127,63 @@ describe('2. small blobs cost at least 4 KiB, and an account holds a capped numb
     assert.equal(configFromEnv({ STORAGE_MAX_BLOBS: '50' }).maxBlobsPerAccount, 50);
   });
 });
+
+describe('3. strangers cost no signature check, and signed requests are rate limited per address', () => {
+  let b: Box, cf: Box;
+  before(async () => {
+    b = await box();
+    cf = await box({ behindCloudflare: true, authBurst: 3, authPerSecond: 0.001 });
+  });
+  after(async () => { await b.close(); await cf.close(); });
+
+  it('refuses an unknown key before checking its signature', async () => {
+    const stranger = key(), body = randomBytes(10);
+    const r = await put(b, stranger, body, { tamper: true });
+    assert.equal(r.status, 403);
+    assert.match(r.headers.get('x-reason')!, /may not write/);
+    const x = sha(body);
+    const pre = await fetch(`${b.url}/upload`, { method: 'HEAD', headers: { authorization: auth(stranger, { t: 'upload', x: [x], now: b.clock.now, tamper: true }), 'x-sha-256': x, 'x-content-length': '10' } });
+    assert.equal(pre.status, 403);
+    const del = await fetch(`${b.url}/${x}`, { method: 'DELETE', headers: { authorization: auth(stranger, { t: 'delete', x: [x], now: b.clock.now, tamper: true }) } });
+    assert.equal(del.status, 404);
+    const list = await fetch(`${b.url}/list/${b.owner.pk}`, { headers: { authorization: auth(stranger, { t: 'list', now: b.clock.now, tamper: true }) } });
+    assert.equal(list.status, 403);
+    // a known key with a bad signature is still a 401
+    assert.equal((await put(b, b.owner, body, { tamper: true })).status, 401);
+  });
+
+  it('answers 429 to an address sending too many signed requests, by CF-Connecting-IP behind Cloudflare', async () => {
+    const send = (ip: string) => fetch(`${cf.url}/list/${cf.owner.pk}`, { headers: { authorization: auth(cf.owner, { t: 'list', now: cf.clock.now }), 'cf-connecting-ip': ip } });
+    for (let i = 0; i < 3; i++) assert.equal((await send('203.0.113.7')).status, 200);
+    const r = await send('203.0.113.7');
+    assert.equal(r.status, 429);
+    assert.ok(r.headers.get('x-reason'));
+    assert.equal((await send('203.0.113.8')).status, 200); // another address has its own allowance
+    assert.equal((await fetch(`${cf.url}/`, { headers: { 'cf-connecting-ip': '203.0.113.7' } })).status, 200); // unsigned reads are not limited
+  });
+
+  it('ignores CF-Connecting-IP unless told it is behind Cloudflare', async () => {
+    const other = await box({ authBurst: 2, authPerSecond: 0.001 });
+    try {
+      const send = (ip: string) => fetch(`${other.url}/list/${other.owner.pk}`, { headers: { authorization: auth(other.owner, { t: 'list', now: other.clock.now }), 'cf-connecting-ip': ip } });
+      assert.equal((await send('203.0.113.1')).status, 200);
+      assert.equal((await send('203.0.113.2')).status, 200);
+      assert.equal((await send('203.0.113.3')).status, 429); // all from the one socket address
+    } finally {
+      await other.close();
+    }
+  });
+});
+
+describe('3b. the rate limit itself', () => {
+  it('refills over time and remembers a bounded number of addresses', async () => {
+    const { RateLimit } = await import('../src/limit.ts');
+    const l = new RateLimit({ burst: 2, perSecond: 1, maxAddresses: 3 });
+    assert.equal(l.take('a', 0), true);
+    assert.equal(l.take('a', 0), true);
+    assert.equal(l.take('a', 0), false);
+    assert.equal(l.take('a', 1000), true);
+    for (let i = 0; i < 100; i++) l.take(`10.0.0.${i}`, 2000);
+    assert.equal(l.size, 3);
+  });
+});

@@ -63,7 +63,7 @@ export async function box(over: Partial<Config> = {}, opts: { dir?: string; owne
   const clock = { now: Math.floor(Date.now() / 1000) };
   const run = await start({
     dataDir: dir, host: '127.0.0.1', port: 0, publicUrl: `https://${DOMAIN}`, domains: [DOMAIN], owner: owner.pk,
-    maxBlobBytes: 1024 * 1024, maxBlobsPerAccount: 200_000, binDays: 30, mirrorTimeoutMs: 5000, diskMarginBytes: 0, now: () => clock.now, ...over,
+    maxBlobBytes: 1024 * 1024, maxBlobsPerAccount: 200_000, binDays: 30, mirrorTimeoutMs: 5000, diskMarginBytes: 0, behindCloudflare: false, now: () => clock.now, ...over,
   });
   return {
     run, url: run.url, owner, clock, dir,

@@ -21,18 +21,30 @@ const MAX_HEADER = 16 * 1024;
 /** Most `x` tags one authorization may carry. Each is a database lookup per request. */
 export const MAX_X_TAGS = 16;
 
-const fail = (reason: string): AuthResult => ({ ok: false, status: 401, reason });
+const fail = (reason: string): { ok: false; status: number; reason: string } => ({ ok: false, status: 401, reason });
 
 export function eventId(e: { pubkey: string; created_at: number; kind: number; tags: string[][]; content: string }): string {
   return createHash('sha256').update(JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content])).digest('hex');
 }
 
+/** A kind 24242 event whose shape is right but whose signature and tags are not checked yet. */
+export interface Unchecked {
+  id: string;
+  pubkey: string;
+  sig: string;
+  created_at: number;
+  kind: number;
+  tags: string[][];
+  content: string;
+}
+
+export type Parsed = { ok: true; event: Unchecked } | { ok: false; status: number; reason: string };
+
 /**
- * Checks the header for `verb`: a valid signed kind 24242 event, `created_at` not in the future, an `expiration`
- * in the future, a `t` tag for the verb, and a `server` tag naming one of `domains` (required here: a token without
- * one can be replayed on any server). `x` tags are returned for the caller to match against the blob.
+ * Reads the header into an event without checking its signature, so the caller can refuse a key that may not do
+ * anything here before paying for a signature check.
  */
-export function readAuth(header: string | undefined, verb: Verb, domains: string[], now: number): AuthResult {
+export function parseAuth(header: string | undefined): Parsed {
   if (!header) return fail('authorization required');
   if (header.length > MAX_HEADER) return fail('authorization too large');
   const m = /^Nostr\s+([A-Za-z0-9+/_=-]+)$/.exec(header.trim());
@@ -49,14 +61,16 @@ export function readAuth(header: string | undefined, verb: Verb, domains: string
       !e.tags.every((t: unknown) => Array.isArray(t) && t.length > 0 && t.every((s) => typeof s === 'string'))) {
     return fail('authorization is not a kind 24242 event');
   }
+  return { ok: true, event: e as Unchecked };
+}
+
+/**
+ * Checks a parsed event for `verb`: `created_at` not in the future, an `expiration` in the future, a `t` tag for
+ * the verb, a `server` tag naming one of `domains` (required here: a token without one can be replayed on any
+ * server), and last the signature. `x` tags are returned for the caller to match against the blob.
+ */
+export function checkAuth(e: Unchecked, verb: Verb, domains: string[], now: number): AuthResult {
   if (eventId(e) !== e.id) return fail('authorization id is wrong');
-  let good = false;
-  try {
-    good = schnorr.verify(Buffer.from(e.sig, 'hex'), Buffer.from(e.id, 'hex'), Buffer.from(e.pubkey, 'hex'));
-  } catch {
-    good = false;
-  }
-  if (!good) return fail('authorization signature is wrong');
   if (e.created_at > now + SKEW) return fail('authorization is from the future');
   const tags = (name: string): string[] => e.tags.filter((t: string[]) => t[0] === name && t.length > 1).map((t: string[]) => t[1]);
   const exp = tags('expiration');
@@ -67,5 +81,18 @@ export function readAuth(header: string | undefined, verb: Verb, domains: string
   if (!servers.some((s) => domains.includes(s))) return fail('authorization is for another server');
   const xs = tags('x').map((x) => x.toLowerCase()).filter((x) => H64.test(x));
   if (xs.length > MAX_X_TAGS) return fail(`authorization has more than ${MAX_X_TAGS} x tags`);
+  let good = false;
+  try {
+    good = schnorr.verify(Buffer.from(e.sig, 'hex'), Buffer.from(e.id, 'hex'), Buffer.from(e.pubkey, 'hex'));
+  } catch {
+    good = false;
+  }
+  if (!good) return fail('authorization signature is wrong');
   return { ok: true, auth: { pubkey: e.pubkey, xs } };
+}
+
+/** parseAuth then checkAuth. */
+export function readAuth(header: string | undefined, verb: Verb, domains: string[], now: number): AuthResult {
+  const p = parseAuth(header);
+  return p.ok ? checkAuth(p.event, verb, domains, now) : p;
 }
