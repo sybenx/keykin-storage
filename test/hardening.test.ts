@@ -258,3 +258,24 @@ describe('5. /mirror is for the owner only', () => {
     }
   });
 });
+
+describe('6. tokens age out', () => {
+  let b: Box;
+  before(async () => { b = await box(); });
+  after(() => b.close());
+  const H = 3600;
+
+  it('refuses an expiration more than 25 hours ahead', async () => {
+    const r = await put(b, b.owner, randomBytes(10), { expiration: b.clock.now + 26 * H });
+    assert.equal(r.status, 401);
+    assert.match(r.headers.get('x-reason')!, /expiration/);
+    assert.equal((await put(b, b.owner, randomBytes(10), { expiration: b.clock.now + 24 * H })).status, 201);
+  });
+
+  it('refuses a created_at more than 25 hours old', async () => {
+    const r = await put(b, b.owner, randomBytes(10), { createdAt: b.clock.now - 26 * H });
+    assert.equal(r.status, 401);
+    assert.match(r.headers.get('x-reason')!, /old/);
+    assert.equal((await put(b, b.owner, randomBytes(10), { createdAt: b.clock.now - 24 * H })).status, 201);
+  });
+});

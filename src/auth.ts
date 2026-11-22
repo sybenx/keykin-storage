@@ -17,6 +17,8 @@ const HEX = (n: number) => new RegExp(`^[0-9a-f]{${n}}$`);
 const H64 = HEX(64), H128 = HEX(128);
 /** A signature can't be from the future by more than this (clock skew), seconds. */
 const SKEW = 60;
+/** How long one token may live: `created_at` at most this old, `expiration` at most this far ahead, seconds. */
+export const MAX_AGE = 25 * 3600;
 const MAX_HEADER = 16 * 1024;
 /** Most `x` tags one authorization may carry. Each is a database lookup per request. */
 export const MAX_X_TAGS = 16;
@@ -65,16 +67,19 @@ export function parseAuth(header: string | undefined): Parsed {
 }
 
 /**
- * Checks a parsed event for `verb`: `created_at` not in the future, an `expiration` in the future, a `t` tag for
+ * Checks a parsed event for `verb`: `created_at` not in the future and at most 25 hours old, an `expiration` in
+ * the future and at most 25 hours ahead (so a leaked token ages out), a `t` tag for
  * the verb, a `server` tag naming one of `domains` (required here: a token without one can be replayed on any
  * server), and last the signature. `x` tags are returned for the caller to match against the blob.
  */
 export function checkAuth(e: Unchecked, verb: Verb, domains: string[], now: number): AuthResult {
   if (eventId(e) !== e.id) return fail('authorization id is wrong');
   if (e.created_at > now + SKEW) return fail('authorization is from the future');
+  if (e.created_at < now - MAX_AGE) return fail('authorization is too old: sign a new one');
   const tags = (name: string): string[] => e.tags.filter((t: string[]) => t[0] === name && t.length > 1).map((t: string[]) => t[1]);
   const exp = tags('expiration');
   if (exp.length !== 1 || !/^\d+$/.test(exp[0]) || Number(exp[0]) <= now) return fail('authorization expired or has no expiration');
+  if (Number(exp[0]) > now + MAX_AGE) return fail('authorization expiration is more than 25 hours ahead');
   if (!tags('t').includes(verb)) return fail(`authorization is not for ${verb}`);
   const servers = tags('server').map((s) => s.toLowerCase());
   if (servers.length === 0) return fail('authorization needs a server tag');
