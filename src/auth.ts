@@ -1,4 +1,5 @@
-// BUD-11 authorization: `Authorization: Nostr <base64url of a kind 24242 event>`.
+// BUD-11 authorization: `Authorization: Nostr <base64url of a kind 24242 event>`. And NIP-98 HTTP auth (kind 27235)
+// for the management surface.
 
 import { createHash } from 'node:crypto';
 import { schnorr } from '@noble/curves/secp256k1.js';
@@ -23,13 +24,18 @@ const MAX_HEADER = 16 * 1024;
 /** Most `x` tags one authorization may carry. Each is a database lookup per request. */
 export const MAX_X_TAGS = 16;
 
+/** NIP-98 HTTP auth. */
+export const HTTP_AUTH_KIND = 27235;
+/** How far a NIP-98 event's `created_at` may be from now, either way, seconds. */
+export const HTTP_AUTH_WINDOW = 60;
+
 const fail = (reason: string): { ok: false; status: number; reason: string } => ({ ok: false, status: 401, reason });
 
 export function eventId(e: { pubkey: string; created_at: number; kind: number; tags: string[][]; content: string }): string {
   return createHash('sha256').update(JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content])).digest('hex');
 }
 
-/** A kind 24242 event whose shape is right but whose signature and tags are not checked yet. */
+/** An event (kind 24242 or 27235) whose shape is right but whose signature and tags are not checked yet. */
 export interface Unchecked {
   id: string;
   pubkey: string;
@@ -40,13 +46,22 @@ export interface Unchecked {
   content: string;
 }
 
+/** Whether the event's signature is good for its id and pubkey. The id must be checked first. */
+function signed(e: Unchecked): boolean {
+  try {
+    return schnorr.verify(Buffer.from(e.sig, 'hex'), Buffer.from(e.id, 'hex'), Buffer.from(e.pubkey, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
 export type Parsed = { ok: true; event: Unchecked } | { ok: false; status: number; reason: string };
 
 /**
  * Reads the header into an event without checking its signature, so the caller can refuse a key that may not do
  * anything here before paying for a signature check.
  */
-export function parseAuth(header: string | undefined): Parsed {
+export function parseAuth(header: string | undefined, kind = 24242): Parsed {
   if (!header) return fail('authorization required');
   if (header.length > MAX_HEADER) return fail('authorization too large');
   const m = /^Nostr\s+([A-Za-z0-9+/_=-]+)$/.exec(header.trim());
@@ -59,9 +74,9 @@ export function parseAuth(header: string | undefined): Parsed {
   }
   if (!e || typeof e !== 'object' || typeof e.id !== 'string' || !H64.test(e.id) || typeof e.pubkey !== 'string' ||
       !H64.test(e.pubkey) || typeof e.sig !== 'string' || !H128.test(e.sig) || !Number.isSafeInteger(e.created_at) ||
-      e.kind !== 24242 || typeof e.content !== 'string' || !Array.isArray(e.tags) ||
+      e.kind !== kind || typeof e.content !== 'string' || !Array.isArray(e.tags) ||
       !e.tags.every((t: unknown) => Array.isArray(t) && t.length > 0 && t.every((s) => typeof s === 'string'))) {
-    return fail('authorization is not a kind 24242 event');
+    return fail(`authorization is not a kind ${kind} event`);
   }
   return { ok: true, event: e as Unchecked };
 }
@@ -86,14 +101,32 @@ export function checkAuth(e: Unchecked, verb: Verb, domains: string[], now: numb
   if (!servers.some((s) => domains.includes(s))) return fail('authorization is for another server');
   const xs = tags('x').map((x) => x.toLowerCase()).filter((x) => H64.test(x));
   if (xs.length > MAX_X_TAGS) return fail(`authorization has more than ${MAX_X_TAGS} x tags`);
-  let good = false;
-  try {
-    good = schnorr.verify(Buffer.from(e.sig, 'hex'), Buffer.from(e.id, 'hex'), Buffer.from(e.pubkey, 'hex'));
-  } catch {
-    good = false;
-  }
-  if (!good) return fail('authorization signature is wrong');
+  if (!signed(e)) return fail('authorization signature is wrong');
   return { ok: true, auth: { pubkey: e.pubkey, xs } };
+}
+
+/** What a NIP-98 event must name: the urls it may be for (exact), the HTTP method, and the body's bytes. */
+export interface HttpRequest {
+  urls: string[];
+  method: string;
+  body: Uint8Array;
+}
+
+/**
+ * Checks a parsed kind 27235 event against a request: `created_at` within a minute of now either way, a `u` tag that
+ * is one of `urls`, a `method` tag, a `payload` tag with the body's sha256, then the id and last the signature.
+ */
+export function checkHttpAuth(e: Unchecked, req: HttpRequest, now: number): { ok: true; pubkey: string } | { ok: false; status: number; reason: string } {
+  if (e.created_at > now + HTTP_AUTH_WINDOW) return fail('authorization is from the future: check this device\'s clock');
+  if (e.created_at < now - HTTP_AUTH_WINDOW) return fail('authorization is more than a minute old: sign a new one');
+  const tag = (name: string): string | undefined => e.tags.find((t) => t[0] === name)?.[1];
+  const u = tag('u');
+  if (u === undefined || !req.urls.includes(u)) return fail('authorization is for another url');
+  if (tag('method') !== req.method) return fail(`authorization is not for ${req.method}`);
+  if (tag('payload')?.toLowerCase() !== createHash('sha256').update(req.body).digest('hex')) return fail('authorization payload does not match the body');
+  if (eventId(e) !== e.id) return fail('authorization id is wrong');
+  if (!signed(e)) return fail('authorization signature is wrong');
+  return { ok: true, pubkey: e.pubkey };
 }
 
 /** parseAuth then checkAuth. */
