@@ -88,6 +88,25 @@ export interface Pending {
 
 const ACCOUNT_COLS = 'a.pubkey, a.quota, a.added, a.used, a.blobs, a.hand, a.member';
 
+/** An upload in pieces that is open: what was promised, and how far it got. */
+export interface Upload {
+  id: string;
+  /** The account that started it: the only one that may touch it. */
+  account: string;
+  sha256: string;
+  size: number;
+  type: string;
+  /** Bytes in each piece but the last, fixed when the upload starts. */
+  pieceSize: number;
+  /** Bytes of the pieces received so far. */
+  received: number;
+  created: number;
+  /** When it started or last got a piece: it is open until this plus the idle time. */
+  touched: number;
+}
+
+const UPLOAD_COLS = 'id, account, sha256, size, type, piece_size AS pieceSize, received, created, touched';
+
 /**
  * Schema changes after 0.1.0, in order. `PRAGMA user_version` says how many have run. Each runs once, in a
  * transaction, on a new database as well as an old one.
@@ -146,6 +165,17 @@ const MIGRATIONS: ((db: Db) => void)[] = [
     } catch {}
     if (typeof owner === 'string' && /^[0-9a-f]{64}$/.test(owner)) db.sql.prepare('UPDATE home_state SET home_owner = ? WHERE id = 1').run(owner);
   },
+  // 0.4.0: uploads in pieces, kept here so they can resume after a restart. They go with their account. (IF NOT
+  // EXISTS: a test winds a new database back to 0.2.0 by its user_version alone.)
+  (db) => db.sql.exec(`
+    CREATE TABLE IF NOT EXISTS uploads (
+      id TEXT PRIMARY KEY, account TEXT NOT NULL REFERENCES accounts(pubkey) ON DELETE CASCADE, sha256 TEXT NOT NULL,
+      size INTEGER NOT NULL, type TEXT NOT NULL, piece_size INTEGER NOT NULL, received INTEGER NOT NULL DEFAULT 0,
+      created INTEGER NOT NULL, touched INTEGER NOT NULL, UNIQUE (account, sha256));
+    CREATE INDEX IF NOT EXISTS uploads_touched ON uploads(touched);
+    CREATE TABLE IF NOT EXISTS upload_pieces (
+      upload TEXT NOT NULL REFERENCES uploads(id) ON DELETE CASCADE, idx INTEGER NOT NULL, bytes INTEGER NOT NULL,
+      PRIMARY KEY (upload, idx));`),
 ];
 
 export interface Owned extends Blob {
@@ -539,6 +569,95 @@ export class Db {
     }
     return this.sql.prepare(`SELECT ${cols} FROM owners o JOIN blobs b ON b.sha256 = o.sha256 WHERE o.key = ?
       ORDER BY o.uploaded DESC, o.sha256 DESC LIMIT ?`).all(key, limit) as unknown as Owned[];
+  }
+
+  // --- uploads in pieces. An upload counts as open while `touched` is after `since` (now less the idle time).
+
+  upload(id: string): Upload | null {
+    return (this.sql.prepare(`SELECT ${UPLOAD_COLS} FROM uploads WHERE id = ?`).get(id) as unknown as Upload) ?? null;
+  }
+
+  /** Every upload row, open or not. */
+  uploads(): Upload[] {
+    return this.sql.prepare(`SELECT ${UPLOAD_COLS} FROM uploads`).all() as unknown as Upload[];
+  }
+
+  /** The account's open upload of this blob, if any. */
+  uploadOf(account: string, sha256: string, since: number): Upload | null {
+    return (this.sql.prepare(`SELECT ${UPLOAD_COLS} FROM uploads WHERE account = ? AND sha256 = ? AND touched > ?`)
+      .get(account, sha256, since) as unknown as Upload) ?? null;
+  }
+
+  /**
+   * What the account's open uploads hold back from its quota: each one's full size (at least MIN_CHARGE) and one
+   * blob each, leaving out `except`. At most a few rows, read through the (account, sha256) index.
+   */
+  openFor(account: string, since: number, except: string | null = null): Pending {
+    const r = this.sql.prepare(`SELECT COALESCE(SUM(MAX(size, ${MIN_CHARGE})), 0) AS bytes, COUNT(*) AS n FROM uploads
+      WHERE account = ? AND touched > ? AND id IS NOT ?`).get(account, since, except)!;
+    return { bytes: Number(r.bytes), n: Number(r.n) };
+  }
+
+  /** How many uploads are open on the whole box, and the bytes they still have to receive (held back from the disk). */
+  openAll(since: number): { n: number; remaining: number } {
+    const r = this.sql.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(size - received), 0) AS remaining FROM uploads WHERE touched > ?').get(since)!;
+    return { n: Number(r.n), remaining: Number(r.remaining) };
+  }
+
+  /**
+   * Opens an upload for the account `key` writes for, in one transaction with the checks: `check` gets the account
+   * and returns a refusal or null. A CLI `remove` can't land between the check and the write.
+   */
+  openUpload(key: string, u: Omit<Upload, 'account' | 'received'>, check: (a: Account) => { status: number; reason: string } | null):
+      { ok: true; upload: Upload } | { ok: false; status: number; reason: string } {
+    return this.tx(() => {
+      const account = this.accountOf(key);
+      if (!account) return { ok: false, status: 403, reason: 'this key may not write here' };
+      const why = check(account);
+      if (why) return { ok: false, ...why };
+      this.sql.prepare(`INSERT INTO uploads (id, account, sha256, size, type, piece_size, received, created, touched)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`).run(u.id, account.pubkey, u.sha256, u.size, u.type, u.pieceSize, u.created, u.touched);
+      return { ok: true, upload: this.upload(u.id)! };
+    });
+  }
+
+  /** The pieces received, in order. */
+  pieces(id: string): number[] {
+    return this.sql.prepare('SELECT idx FROM upload_pieces WHERE upload = ? ORDER BY idx').all(id).map((r) => Number(r.idx));
+  }
+
+  pieceCount(id: string): number {
+    return Number(this.sql.prepare('SELECT COUNT(*) AS n FROM upload_pieces WHERE upload = ?').get(id)!.n);
+  }
+
+  /** Records a piece as received and the upload as touched. False when the upload is gone. */
+  markPiece(id: string, idx: number, bytes: number, now: number): boolean {
+    return this.tx(() => {
+      if (!this.sql.prepare('SELECT 1 FROM uploads WHERE id = ?').get(id)) return false;
+      const added = this.sql.prepare('INSERT OR IGNORE INTO upload_pieces (upload, idx, bytes) VALUES (?, ?, ?)').run(id, idx, bytes).changes;
+      this.sql.prepare('UPDATE uploads SET received = received + ?, touched = ? WHERE id = ?').run(added ? bytes : 0, now, id);
+      return true;
+    });
+  }
+
+  /** Forgets a piece (it is being sent again). */
+  unmarkPiece(id: string, idx: number): void {
+    this.tx(() => {
+      const r = this.sql.prepare('SELECT bytes FROM upload_pieces WHERE upload = ? AND idx = ?').get(id, idx);
+      if (!r) return;
+      this.sql.prepare('DELETE FROM upload_pieces WHERE upload = ? AND idx = ?').run(id, idx);
+      this.sql.prepare('UPDATE uploads SET received = received - ? WHERE id = ?').run(r.bytes, id);
+    });
+  }
+
+  /** Forgets an upload and its pieces. Returns whether it was there. Delete its file after. */
+  dropUpload(id: string): boolean {
+    return this.sql.prepare('DELETE FROM uploads WHERE id = ?').run(id).changes > 0;
+  }
+
+  /** Ids of uploads no longer open (touched at or before `since`). */
+  expiredUploads(since: number): string[] {
+    return this.sql.prepare('SELECT id FROM uploads WHERE touched <= ?').all(since).map((r) => r.id as string);
   }
 
   // --- the bin
