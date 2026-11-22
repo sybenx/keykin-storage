@@ -6,7 +6,7 @@ file nobody owns any more waits 30 days in a bin first.
 
 See [DESIGN.md](DESIGN.md) for why it exists and where it's going (the keeper, key grants, the admin page).
 
-## What works now (0.2.0)
+## What works now (0.3.0)
 
 - **BUD-01** `GET/HEAD /<sha256>[.ext]`: Range requests, CORS, `nosniff` and a sandbox CSP on every blob. Images
   (not SVG), video and audio are served as their type; everything else, SVG included, as
@@ -37,6 +37,8 @@ See [DESIGN.md](DESIGN.md) for why it exists and where it's going (the keeper, k
   second over a minute is cut off (408).
 - `/mirror` skips the fetch only when your account already holds that one blob. Otherwise it fetches and keeps
   what the url actually serves, if that's one of your `x` tags.
+- **Management** `POST /manage`: disk use, accounts, the bin, restore and erase, for a web page signed in as the
+  box owner or one of the home's admins. See below.
 
 Not here: BUD-05 media, BUD-07 payments, BUD-08, BUD-09 reports.
 
@@ -154,6 +156,9 @@ npm run accounts -- bin
 npm run accounts -- restore <sha256>
 ```
 
+`restore` gives the blob back to the account it is charged to, or to you when that account is gone. Name an npub
+after the hash to give it to someone else.
+
 Removing a friend lets go of everything their keys held. What nobody else holds goes to the bin. A friend who
 is also a member of your home comes back at the next check; remove them on the home to keep them out.
 
@@ -171,6 +176,77 @@ npm run accounts -- remove npub1… --purge
 erases everything only that account holds (blobs someone else also holds stay). Blobs are served with a one-day
 cache lifetime, so after an erase also purge the blob's URL from your edge cache (on Cloudflare: Caching,
 Configuration, Purge by URL), or it may be served from there for up to a day.
+
+## Management (`POST /manage`)
+
+A web page can show disk use and the bin, and restore or erase what is in it. Who may:
+
+- **owner:** `STORAGE_OWNER`, or the owner your home reports. Everything.
+- **admin:** a key in the `admins` list your home sends with its member list. Everything but `erase`. A home that
+  sends no `admins` has none. When the home can't be reached, the last good list of admins stays.
+
+Anyone else, members included, gets 401.
+
+### Request
+
+```
+POST <STORAGE_PUBLIC_URL>/manage
+Content-Type: application/nostr+json+rpc
+Authorization: Nostr <base64 of a signed kind 27235 event>
+
+{"method":"usage","params":[]}
+```
+
+The event's tags: `u` is `STORAGE_PUBLIC_URL` followed by `/manage` (a slash left on the end of the public url is
+all right: `https://x//manage` works too, `https://x/manage/` does not), `method` is `POST`, `payload` is the hex
+sha256 of the exact body bytes. `created_at` must be within 60 seconds of the box's clock, either way. Content is
+not read. The body is at most 64 KiB. `info` needs no `Authorization`.
+
+### Replies
+
+HTTP 200 with `{"result": …}`, or HTTP 200 with `{"error": "…"}` for a call that can't be done (unknown method, bad
+params). Every other status also has a JSON body `{"error": "…"}`:
+
+| Status | When |
+|---|---|
+| 401 | no or bad `Authorization`, a key that may not manage this box, or an admin calling `erase` |
+| 400 | the body isn't `{"method": "...", "params": [...]}` |
+| 405 | not POST (`/manage`) or not GET (`/manage/info`) |
+| 413 | the body is over 64 KiB |
+| 415 | the content type isn't `application/nostr+json+rpc` |
+| 429 | too many signed requests from your address (the same limit as uploads) |
+| 503 | the box isn't set up yet (`info` still answers) |
+
+CORS is open (`*`), with `Authorization` allowed, and the preflight answers 204.
+
+### Methods
+
+| Method | Who | Result |
+|---|---|---|
+| `info []` | anyone, unsigned; also `GET /manage/info` | `{pubkey, home}`: this storage's key (hex) and the home url it follows, or null |
+| `usage []` | owner, admin | `{disk: {used, free}, total: {bytes, blobs}, accounts: [{pubkey, used, blobs, quota, member, hand}]}` |
+| `bin []` | owner, admin | `{items: [{sha256, size, type, charged, binnedAt, erasesAt}], more, parked: [{pubkey, removedAt, reason, bytes, blobs, erasesAt}]}` |
+| `restore [[sha256, ...]]` | owner, admin | `{restored: n}` |
+| `erase [[sha256, ...]]` | owner | `{erased: n}` |
+
+- Bytes are numbers of bytes, times are Unix seconds, pubkeys are hex.
+- `disk`: the data volume's used and free bytes (null if the box can't read them). `total`: every blob stored, the
+  binned ones too, by real size.
+- `accounts[].used`: what counts against the quota (each blob at least 4 KiB, binned ones included). `quota` is null
+  for no limit. `member`: on the home's member list. `hand`: added by hand.
+- `items`: newest first, at most 5,000, with `more: true` when there are more. `charged` is the account the bytes
+  count against, or null when that account is gone. `erasesAt` is when the bin erases it (at the next hourly sweep
+  after).
+- `parked`: members the home removed whose files are waiting for them to come back, until `erasesAt`. `bytes` and
+  `blobs` count everything they get back on return (counted like quotas, shared files included). `reason` is
+  `removed` or `erased`.
+- `restore` gives each binned blob back to the account it is charged to, or to the box owner when that account is
+  gone. Hashes not in the bin are skipped (not counted).
+- `erase` deletes each blob's record and file now, whoever holds it, binned or not. Hashes not here are skipped.
+  Purge them from your edge cache too.
+- At most 500 hashes per call. A hash that isn't 64 hex characters makes the whole call an error, and nothing is
+  done.
+- An unknown method answers `{"error": "unknown method"}`.
 
 ## Tests
 

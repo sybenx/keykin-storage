@@ -1,4 +1,4 @@
-# Keykin Storage: design (draft, 2026-11-20, updated for 0.2.0 on 2026-11-21)
+# Keykin Storage: design (draft, 2026-11-20, updated for 0.2.0 on 2026-11-21 and 0.3.0 on 2026-11-22)
 
 Working name. A small Blossom server and keeper that runs on your Keykin box, so your files have a home
 you own. It is the storage half of Marble as a Google Drive replacement. It is built for vaults
@@ -120,7 +120,8 @@ says so when it detects a tunnel door.
   through the app proxy, and the admin page sits behind the Umbrel login. It is a separate container from
   Keykin Box, because the signer stays small.
 - **Admin page:** accounts and quotas, disk used and free, the bin (restore), keeper status per server
-  ("nostr.download: 1,204 blobs, 2 missing, repaired 11:40").
+  ("nostr.download: 1,204 blobs, 2 missing, repaired 11:40"). Since 0.3.0 the box answers a signed `POST /manage`
+  (§10) for the page to read and act through.
 - **Tests:** `node --test`, covering the BUD request and response cases from the spec texts, the probe
   sequence from vaults §6.4, the SSRF guard table, and quota and bin edge cases. A conformance run
   against a real Marble upload before release.
@@ -154,6 +155,7 @@ grants.
    in a file's backup state.
 5. Key grants and `PUT /keys` (server-key-authorization proposal), once decided.
 6. Done in 0.2.0: the review fixes (§9) and accounts that follow the home's member list (§8).
+7. Done in 0.3.0: the management surface a web page builds on (§10).
 
 ## 8. Accounts that follow the home's member list (0.2.0)
 
@@ -164,8 +166,8 @@ The home is the single source of truth for who may upload, with no step on this 
 - **The call.** `POST <home>/`, `Content-Type: application/nostr+json+rpc`, body
   `{"method":"memberkeys","params":[]}`, `Authorization: Nostr <base64 kind 27235>` signed by the service key,
   tags `u` (the exact url, with its trailing slash), `method` `POST`, `payload` (sha256 of the body). The reply
-  is `{"result":{"owner","members":[…],"removed":[{"pubkey","removedAt","deletesAt","reason"}]}}` or
-  `{"error"}`. Field names live in one table in `src/home.ts`.
+  is `{"result":{"owner","members":[…],"removed":[{"pubkey","removedAt","deletesAt","reason"}],"admins":[…]}}` or
+  `{"error"}`. `admins` (0.3.0) may be absent, which means none. Field names live in one table in `src/home.ts`.
 - **When.** Every `STORAGE_HOME_POLL_S` (300) seconds, and when an unknown key tries to write: one refresh, then
   a second look, at most once a minute overall. After a 429 it waits two minutes.
 - **Failure is not removal.** The last good list is in the database. An unreachable home, an error, a 401, a 429,
@@ -192,3 +194,26 @@ lifetime; `/mirror` for the owner only; tokens at most 25 hours old or ahead; up
 minute cut off and a deadline on the `/mirror` body; only media served inline; a quiet 400 for a malformed
 request line; the account check and the ownership write in one transaction; numeric settings checked at start;
 `::ffff:0:0:0/96` in the mirror blocklist.
+
+## 10. The management surface (0.3.0)
+
+`POST /manage` lets a web page show disk use and the bin and restore or erase, without the CLI. The full contract is
+in the README.
+
+- **One endpoint, the home's shape.** `Content-Type: application/nostr+json+rpc`, `{"method","params"}`, replies
+  `{"result"}` or `{"error"}`, signed with NIP-98 (kind 27235: `u` the public url plus `/manage`, `method` POST,
+  `payload` the body's sha256, `created_at` within 60 s either way), the same shape storage uses to ask the home for
+  its member list.
+- **Who.** Owner: `STORAGE_OWNER` or the owner the home reports. Admin: a key in the home's `admins` list, kept with
+  the last good member list, so an unreachable home changes nothing. Admins may do everything but `erase`, which can't
+  be undone. With `STORAGE_HOME_URL` unset, the home's owner and admins have no role. A key with no role is refused before its signature is checked,
+  and a miss asks the home again at most once a minute, as for uploads.
+- **Cheap reads.** `usage` reads the account rows (their running totals) and one `totals` row that triggers keep on
+  every blob insert and delete. `bin` reads the bin's index, newest first, capped at 5,000. `parked` reads removed
+  members' totals, set when their files are parked and lowered by a trigger when a parked blob's row goes. Nothing
+  walks the blob folder or sums every blob.
+- **Writes are the CLI's.** `restore` is `Db.restore`, which the CLI now uses too: back to the account the blob is
+  charged to (no change to its quota), else the box owner. `erase` is `Db.eraseNow` plus the file. A call names at
+  most 500 hashes and runs in one transaction; one malformed hash fails the whole call.
+- **Not here yet:** adding friends and quotas, home status, keeper status. Replays inside the minute are possible and
+  harmless: every method reads or is idempotent.

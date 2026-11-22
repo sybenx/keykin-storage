@@ -1,6 +1,6 @@
 {
   "name": "keykin-storage",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A Blossom server and keeper for your Keykin box: your account and friends you add, nothing deleted behind your back.",
   "type": "module",
   "private": true,
