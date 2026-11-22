@@ -332,3 +332,30 @@ describe('7. slow uploads and slow mirror bodies are cut off', () => {
     assert.equal(status, 408);
   });
 });
+
+describe('8. only images, video and audio are served inline', () => {
+  let b: Box;
+  before(async () => { b = await box(); });
+  after(() => b.close());
+
+  it('serves HTML, SVG and the rest as an octet-stream attachment, media as itself', async () => {
+    const cases: [string, string, boolean][] = [
+      ['text/html', 'application/octet-stream', true],
+      ['image/svg+xml', 'application/octet-stream', true],
+      ['application/pdf', 'application/octet-stream', true],
+      ['application/xhtml+xml', 'application/octet-stream', true],
+      ['image/png', 'image/png', false],
+      ['video/mp4', 'video/mp4', false],
+      ['audio/ogg', 'audio/ogg', false],
+    ];
+    for (const [sent, served, attachment] of cases) {
+      const body = randomBytes(20);
+      const up = await put(b, b.owner, body, {}, { 'content-type': sent });
+      assert.equal(((await up.json()) as any).type, sent); // the descriptor keeps what was sent
+      const g = await fetch(`${b.url}/${sha(body)}`);
+      assert.equal(g.headers.get('content-type'), served, sent);
+      assert.equal(/^attachment/.test(g.headers.get('content-disposition') ?? ''), attachment, sent);
+      await g.arrayBuffer();
+    }
+  });
+});

@@ -187,7 +187,10 @@ export async function start(config: Config): Promise<Running> {
   function get(req: http.IncomingMessage, res: http.ServerResponse, sha: string, head: boolean): void {
     const b = db.blob(sha);
     if (!b || !store.has(sha)) return fail(res, 404, 'not found', head);
-    res.setHeader('content-type', b.type);
+    const type = servedType(b.type);
+    res.setHeader('content-type', type);
+    // anything that isn't plain media is a download, never a page or script on this domain
+    if (type === 'application/octet-stream') res.setHeader('content-disposition', 'attachment');
     res.setHeader('accept-ranges', 'bytes');
     res.setHeader('etag', `"${sha}"`);
     // short and not immutable: after a take-down (CLI erase) an edge purge must stick
@@ -448,6 +451,12 @@ function json(res: http.ServerResponse, status: number, body: unknown): void {
 function header(req: http.IncomingMessage, name: string): string | undefined {
   const v = req.headers[name];
   return Array.isArray(v) ? v[0] : v;
+}
+
+/** The type a blob is served as: images (not SVG, which can carry script), video and audio as stored, the rest as bytes. */
+export function servedType(stored: string): string {
+  if (stored === 'image/svg+xml') return 'application/octet-stream';
+  return /^(image|video|audio)\//.test(stored) ? stored : 'application/octet-stream';
 }
 
 function contentType(raw: string | null | undefined): string {
