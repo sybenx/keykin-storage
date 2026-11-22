@@ -452,6 +452,7 @@ describe('11. numeric settings are checked', () => {
       env: { ...process.env, STORAGE_DIR: dir, STORAGE_ADDR: '127.0.0.1', STORAGE_PORT: '47999', STORAGE_MAX_BLOB_MB: '256M', NODE_NO_WARNINGS: '1' },
       encoding: 'utf8', timeout: 10_000,
     });
+    (await import('node:fs')).rmSync(dir, { recursive: true, force: true });
     assert.equal(r.status, 1);
     assert.match(r.stderr, /STORAGE_MAX_BLOB_MB/);
     assert.doesNotMatch(r.stderr, /at configFromEnv/); // a plain line, not a stack
