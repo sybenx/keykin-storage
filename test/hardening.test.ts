@@ -457,3 +457,10 @@ describe('11. numeric settings are checked', () => {
     assert.doesNotMatch(r.stderr, /at configFromEnv/); // a plain line, not a stack
   });
 });
+
+describe('12. the mirror guard', () => {
+  it('blocks IPv4-translated IPv6 (::ffff:0:0:0/96)', async () => {
+    const { isBlockedAddress } = await import('../src/mirror.ts');
+    for (const ip of ['::ffff:0:7f00:1', '::ffff:0:a00:1', '::ffff:0:0:0', '::ffff:0:ffff:ffff']) assert.equal(isBlockedAddress(ip), true, ip);
+  });
+});
