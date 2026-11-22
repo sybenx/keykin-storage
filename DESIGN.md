@@ -1,4 +1,4 @@
-# Keykin Storage: design (draft, 2026-11-20, updated for 0.2.0 on 2026-11-21 and 0.3.0 on 2026-11-22)
+# Keykin Storage: design (draft, 2026-11-20, updated for 0.2.0 on 2026-11-21, 0.3.0 and 0.4.0 on 2026-11-22)
 
 Working name. A small Blossom server and keeper that runs on your Keykin box, so your files have a home
 you own. It is the storage half of Marble as a Google Drive replacement. It is built for vaults
@@ -42,7 +42,9 @@ nsec. (box-keeper proposal.)
 
 ### 2.2 Server (boxes with a door: Cloudflare Tunnel, Pangolin, a tailnet)
 
-A Blossom server, listed first in the account's kind 10063 list.
+A Blossom server for vault blobs, named in the account's sealed list of vault servers (Kist §3.6, §8.2), not in
+the public kind 10063 media list. It speaks plain Blossom so any vault client can use it, keeps the `server` tag
+required, and does nothing for public media (2026-11-22).
 
 | BUD | Endpoint | Notes |
 |---|---|---|
@@ -56,9 +58,9 @@ A Blossom server, listed first in the account's kind 10063 list.
 Not implemented: BUD-05 media, BUD-07 payments, BUD-08 NIP-94, BUD-09 reports (an account-only server
 has no strangers' content to report). `PUT /media` answers 404.
 
-Size cap: one setting, default 256 MiB per blob. Vault parts are under 8 MiB (vaults §6.1), so this only
-matters for non-vault uploads. Cloudflare Tunnel's free plan cuts requests at about 100 MB, so the app
-says so when it detects a tunnel door.
+Size caps: the largest blob (default 16 GiB since 0.4.0) and, apart from it, the largest single request (default
+256 MiB). Vault parts are under 8 MiB (vaults §6.1). Cloudflare Tunnel's free plan cuts requests at about 100 MB, so
+anything bigger comes in pieces (§11).
 
 ## 3. Who can write
 
@@ -151,11 +153,12 @@ grants.
 2. Keeper: sweeps, fetch and check first (useful today). Then wants, drops and receipts, once the
    keeper proposal is decided.
 3. Admin page and Umbrel package. Runs next to Keykin Box, behind a tunnel or reverse proxy.
-4. Marble: put the box first in kind 10063 when the account has one with a door, and show "on your box"
-   in a file's backup state.
+4. Marble: offer the box as a vault server (the account's vault server list, Kist §3.6) when the account has
+   one with a door, and show "on your box" in a file's backup state. Never add it to kind 10063.
 5. Key grants and `PUT /keys` (server-key-authorization proposal), once decided.
 6. Done in 0.2.0: the review fixes (§9) and accounts that follow the home's member list (§8).
 7. Done in 0.3.0: the management surface a web page builds on (§10).
+8. Done in 0.4.0: uploads in pieces, for full-quality photos and video from phones (§11).
 
 ## 8. Accounts that follow the home's member list (0.2.0)
 
@@ -222,3 +225,37 @@ in the README.
   most 500 hashes and runs in one transaction; one malformed hash fails the whole call.
 - **Not here yet:** adding friends and quotas, home status, keeper status. Replays inside the minute are possible and
   harmless: every method reads or is idempotent.
+
+## 11. Uploads in pieces (0.4.0)
+
+The friends' messenger sends full-quality photos and video, sealed on the phone, often over mobile data that drops.
+Behind a Cloudflare Tunnel no request may carry more than about 100 MB, and before 0.4.0 a dropped connection
+restarted the whole file. The full contract is in the README.
+
+- **Not a Blossom BUD.** No BUD covers this yet, so it is our own small contract next to `PUT /upload`, which is
+  unchanged. Auth is the upload token, with the `x` tag the sha256 of the whole file: the box never stores anything
+  that was not promised by hash, and any valid token for that account and file works on any call (tokens live at
+  most 25 hours).
+- **One file, pieces written in place.** `data/pieces/<id>` is made at the file's full length (sparse), and each
+  piece is written at its offset. Nothing is joined at the end, so a big file is not copied a second time and never
+  needs twice its size on disk. Completing reads the file once, as a stream in 1 MiB chunks, hashing as it goes: the
+  event loop answers other requests between chunks (a test checks small GETs are answered while a 96 MiB file is
+  hashed). Then it is moved into `blobs/` and recorded in the same transaction as a normal upload, with the same
+  account and quota checks.
+- **State in the database.** The `uploads` row (owner account, promised hash and size, piece size, bytes received,
+  last touched) and one `upload_pieces` row per piece received. A piece is recorded only after its bytes are
+  written, and forgotten when it starts being sent again. `data/pieces/` is not wiped at start, so open uploads
+  survive a restart: at start, an upload whose file is gone or not its full length is dropped, and files with no
+  row are removed. Pieces are not fsynced one by one; the whole-file hash at the end catches anything a power cut
+  left wrong.
+- **Holding back.** An open upload holds its whole size (at least 4 KiB) and one blob against the account's quota,
+  and what it has still to receive against the disk margin, from start until it completes, is cancelled or goes
+  24 hours without a new piece. These come from a few indexed rows, so quota checks stay O(1). Pieces and
+  completions take the same in-flight slots as uploads (4 per account, 32 in all) but don't count as blobs to come.
+- **Ownership.** Uploads belong to the account that started them (rows cascade with the account, so a removal from
+  the CLI or the member list takes them; the sweep removes their files within a minute). Every id that is unknown,
+  someone else's or expired gets the same 404.
+- **Retries.** Sending a piece again replaces it, and stops a copy of it still arriving (the phone gave up on it).
+  A second `complete` during the first waits for the same answer. After a lost answer the phone asks
+  `POST /uploads` again: the descriptor says it is stored.
+- **Limits.** 8 MiB pieces (setting), at most 4,096 pieces, at most 2 open uploads per account and 32 on the box.

@@ -6,7 +6,7 @@ file nobody owns any more waits 30 days in a bin first.
 
 See [DESIGN.md](DESIGN.md) for why it exists and where it's going (the keeper, key grants, the admin page).
 
-## What works now (0.3.0)
+## What works now (0.4.0)
 
 - **BUD-01** `GET/HEAD /<sha256>[.ext]`: Range requests, CORS, `nosniff` and a sandbox CSP on every blob. Images
   (not SVG), video and audio are served as their type; everything else, SVG included, as
@@ -14,6 +14,9 @@ See [DESIGN.md](DESIGN.md) for why it exists and where it's going (the keeper, k
   Cached for one day (`public, max-age=86400`), not forever, so a take-down can stick.
 - **BUD-02** `PUT /upload`: streamed to disk and hashed as it arrives, checked against the auth `x` tag (and
   `X-SHA-256` when sent) before it's kept. 201 for a new blob, 200 for one already here.
+- **Uploads in pieces** `POST /uploads` and the rest: files too big for one request (behind a Cloudflare
+  Tunnel, anything near 100 MB) go up in 8 MiB pieces, and a dropped connection costs one piece, not the whole
+  file. Open uploads survive a restart. See below.
 - **BUD-04** `PUT /mirror`: **for the box owner only** (403 for others: a mirror makes the box fetch someone
   else's url from your home address). Fetches over http(s) only, never to loopback, private, link-local, CGNAT,
   tailnet or IPv4-mapped and -translated IPv6 addresses (checked on every connection and redirect), at most
@@ -31,7 +34,8 @@ See [DESIGN.md](DESIGN.md) for why it exists and where it's going (the keeper, k
   200,000 blobs. What a friend deleted stays on their quota until the bin erases it.
 - **Members of your home:** with `STORAGE_HOME_URL` set, the members of your home (your private relay) may
   upload here with the member quota, and stop being able to the moment the home removes them. See below.
-- **Limits:** 4 uploads or mirrors in flight per account and 32 in all (429 past that). Signed requests from one
+- **Limits:** 4 uploads, mirrors, pieces or completions in flight per account and 32 in all (429 past that).
+  2 uploads in pieces open per account and 32 on the box. Signed requests from one
   address: 60 at once, then 10 a second (429 past that). Uploads stop with 507 when less than 1 GB of disk would
   be left. A connection that sends nothing for a minute is closed, and an upload that averages under 16 KiB a
   second over a minute is cut off (408).
@@ -61,7 +65,9 @@ STORAGE_PUBLIC_URL=https://storage.example.com STORAGE_OWNER=npub1… npm start
 | `STORAGE_DOMAINS` | the public URL's host | Comma-separated domains a `server` tag may name |
 | `STORAGE_DIR` | `./data` | Database (`storage.db`), blobs and this storage's key (`service-key`) |
 | `STORAGE_ADDR` / `STORAGE_PORT` | `0.0.0.0` / `7480` | |
-| `STORAGE_MAX_BLOB_MB` | `256` | Largest blob. Vault parts are under 8 MiB |
+| `STORAGE_MAX_BLOB_MB` | `16384` | Largest blob, in MiB (16 GiB), however it arrives. Vault parts are under 8 MiB |
+| `STORAGE_MAX_REQUEST_MB` | `256` | Largest body of one request (`PUT /upload`, `/mirror`), in MiB, never more than the blob cap. Bigger files come in pieces |
+| `STORAGE_PIECE_MB` | `8` | Piece size for uploads in pieces, a whole number of MiB from 1 to 64 |
 | `STORAGE_MAX_BLOBS` | `200000` | Most blobs an account with a quota may hold |
 | `STORAGE_BIN_DAYS` | `30` | |
 | `STORAGE_MIRROR_TIMEOUT_S` | `120` | |
@@ -69,6 +75,9 @@ STORAGE_PUBLIC_URL=https://storage.example.com STORAGE_OWNER=npub1… npm start
 | `STORAGE_HOME_URL` | (none) | Your home's https address. When set, its members may upload here |
 | `STORAGE_MEMBER_QUOTA` | `5G` | Quota of each member of the home |
 | `STORAGE_HOME_POLL_S` | `300` | How often to ask the home for its member list |
+
+Upgrading from 0.3.0: `STORAGE_MAX_BLOB_MB` used to be the cap on one request too. If you raised it to take bigger
+single uploads, also set `STORAGE_MAX_REQUEST_MB`, or those uploads stop at 256 MiB.
 
 Numbers must be positive numbers (`256`, not `256M`; quotas take `5G`, `500M`). A setting it can't read stops
 the server at start, with one line naming the setting.
@@ -80,14 +89,149 @@ the tunnel, so everyone shares one address's allowance of signed requests.
 
 Install Keykin Storage from the Keykin community store (github.com/sybenx/keykin-umbrel). In its settings, set
 `STORAGE_PUBLIC_URL` to the address your tunnel or reverse proxy gives it, and `STORAGE_OWNER` to your npub.
-Until both are set it refuses uploads with 503 and says so on its page. Then put that address first in your
-Nostr server list (kind 10063).
+Until both are set it refuses uploads with 503 and says so on its page. Then add that address to your vault
+servers in Marble (Kist §3.6, the account's sealed list of vault servers). Don't put it in your public Nostr
+media server list (kind 10063): other apps upload post media to the first server there, and this one refuses
+writes without a `server` tag. Until Marble reads the vault server list, putting it second in kind 10063,
+behind your media host, works: Marble uploads vault parts to the first two, other apps only to the first.
 
 On the box, the commands below run inside the container:
 
 ```bash
 docker exec keykin-storage_server_1 node src/cli.ts add npub1… 50G
 ```
+
+## Uploads in pieces
+
+For files too big for one request, and for links that drop. A phone sends the file in pieces, asks what arrived
+when it comes back, sends only what is missing, then asks the box to put it together. The box checks the whole
+file against the sha256 it was promised before it keeps anything.
+
+Every call carries the same `Authorization` as `PUT /upload`: a kind 24242 event with `t` `upload`, a `server` tag
+naming this server, and an `x` tag that is the sha256 of the **whole** file (not of a piece). Any valid token for
+the same account and file works on any call, so an upload that runs longer than a token lives can sign a new one
+mid-way. Only the account that started an upload can touch it.
+
+Sizes are bytes, times are Unix seconds, hashes are lowercase hex. Errors are plain text, with the same words in
+an `x-reason` header.
+
+### Start: `POST /uploads`
+
+```
+POST /uploads
+Authorization: Nostr <base64url of the event>
+Content-Type: application/json
+
+{"sha256": "<sha256 of the whole file>", "size": 123456789, "type": "video/mp4"}
+```
+
+`type` may be null or left out (then `application/octet-stream`). The body is at most 4 KiB.
+
+| Status | Body | When |
+|---|---|---|
+| 201 | status (below) | a new upload: the whole size is held back from your quota and the disk |
+| 200 | status | you already have an open upload of this file: carry on with it |
+| 200 | blob descriptor (`url`, `sha256`, `size`, `type`, `uploaded`) | your account already holds this file: nothing to send |
+| 400 | text | the body is not that shape, `size` is not a whole number of at least 1, `sha256` is not 64 hex |
+| 403 | `sha256 is not in the authorization` | the `x` tag does not name the file |
+| 409 | text naming the open upload | an upload of this sha256 with another size is open: cancel it first |
+| 413 | `files here are at most N bytes`, or a quota reason | too big for this box, or for your quota |
+| 429 | `you have 2 uploads open here, the most at once; ...` or `this box has too many uploads open; ...` | finish or cancel one, or try later |
+| 507 | `this box is out of disk space` | |
+
+Tell the two 200s apart by the body: a descriptor has `url`, a status has `id`.
+
+The status object (also the answer to every piece and to `GET /uploads/<id>`):
+
+```json
+{"id": "<32 hex>", "sha256": "<sha256>", "size": 123456789, "pieceSize": 8388608, "pieces": 15,
+ "received": [0, 1, 4], "expiresAt": 1763900000}
+```
+
+`received` lists the pieces the box has, in order. `expiresAt` is when the upload is discarded if no new piece
+arrives: 24 hours after it started or got its last piece.
+
+### Pieces: `PUT /uploads/<id>/<index>`
+
+The raw bytes of piece `index` (counting from 0), with `Content-Length`. Piece `i` is bytes
+`i * pieceSize` up to `(i + 1) * pieceSize` of the file: every piece is exactly `pieceSize` bytes except the last,
+which is what is left. Send them in any order, several at once if you like (up to 4 requests at once per account,
+counting other uploads). Sending a piece again replaces it; a piece sent again while the first copy is still
+arriving stops the first copy. An optional `X-Piece-SHA-256` header with the piece's own sha256 is checked.
+
+| Status | When |
+|---|---|
+| 200 | the piece is in; the body is the status |
+| 400 | `piece N must be M bytes`, `this upload has pieces 0 to N`, `the piece number must be a whole number`, `piece does not match x-piece-sha-256`, `upload aborted` |
+| 404 | `no such upload` |
+| 408 | `upload too slow: under 16 KiB a second for a minute` |
+| 409 | `this upload is being completed` |
+| 411 | `content-length required` |
+| 429 | too many requests at once, or too many signed requests from your address |
+
+### Status: `GET /uploads/<id>`
+
+200 with the status, or 404 `no such upload`.
+
+### Complete: `POST /uploads/<id>/complete`
+
+No body. With every piece in, the box hashes the whole file and keeps it exactly as `PUT /upload` would. Hashing
+a big file takes a few seconds per gigabyte; other requests are answered meanwhile.
+
+| Status | When |
+|---|---|
+| 201 / 200 | stored (new to the box / it was here already); the body is the blob descriptor, and the upload id is gone |
+| 400 | `N of M pieces are missing; ask for the status and send them` |
+| 409 | `the pieces do not make the promised sha256; the upload is discarded, start over` |
+| 403, 413 | the account may no longer write here, or its quota was lowered meanwhile: the upload is discarded |
+| 404 | `no such upload` |
+| 429 | too many requests at once: try again |
+| 503 | the box is restarting: try again |
+
+A second `complete` while the first is still hashing waits for it and gets the same answer.
+
+### Cancel: `DELETE /uploads/<id>`
+
+204, and what it held back is free again. 404 `no such upload`, or 409 while it is being completed.
+
+### Every call
+
+- An id that is unknown, someone else's, expired or malformed gets the same 404 `no such upload`, so ids can't be
+  probed. A key with no account here gets 403 `this key may not write here` first, whatever the id.
+- 401 for a bad `Authorization` (the reason says what is wrong), including an `x` tag that does not name the file:
+  `authorization must name the upload's sha256 in an x tag`.
+- Each call is a signed request for the per-address limit (60 at once, then 10 a second, 429 past that).
+- CORS is open like everywhere else here.
+
+### What a phone should do
+
+- **A piece fails with a network error, 408, 429, 5xx, or 400 `upload aborted`:** wait a little and send that piece
+  again.
+- **400 on a piece for its size or number:** a bug in the app: check `pieceSize` and `pieces` from the status.
+- **The app restarts, or is not sure what arrived:** `POST /uploads` with the same sha256 and size. 200 with a
+  status: send the pieces not in `received`. 200 with a descriptor: done.
+- **404 on any call** (it expired, was cancelled, the account was removed, or a `complete` succeeded but the
+  answer was lost): `POST /uploads` again. A descriptor means it is stored; a new upload means start over.
+- **400 on complete (pieces missing):** `GET /uploads/<id>`, send what is missing, complete again.
+- **Network error or 503 on complete:** call complete again (it is safe to repeat), or `POST /uploads` to see if it
+  is stored.
+- **409 on complete:** the file read on the phone is not the file it promised: hash it again and start over.
+- **403 or 413:** this box won't take it; tell the person.
+- **401 `authorization is too old`:** sign a new token for the same file and carry on.
+
+### Limits and the largest file
+
+- Pieces are `STORAGE_PIECE_MB` (8 MiB): well under Cloudflare's 100 MB cap on a request, and on a slow phone
+  link a drop loses a few seconds of sending.
+- An upload has at most 4,096 pieces, so the largest file is the smaller of `STORAGE_MAX_BLOB_MB` (16 GiB) and
+  4,096 pieces (32 GiB at 8 MiB). With the defaults: 16 GiB. A member's quota (`STORAGE_MEMBER_QUOTA`, 5 GB) is
+  the real limit for most people.
+- 2 uploads open per account, 32 on the box. An open upload holds its whole size back from the account's quota
+  (and counts as one blob toward the blob cap), and what it has still to receive back from the disk margin.
+- 24 hours without a new piece and it is discarded (swept every minute).
+- A restart keeps open uploads and the pieces received: an update in the middle of a video upload loses at most
+  the pieces that were arriving at that moment. Pieces are not flushed to disk one by one, so after a power cut
+  the whole-file check may fail at complete (409), and the phone starts over.
 
 ## Members of your home
 
