@@ -185,7 +185,10 @@ A web page can show disk use and the bin, and restore or erase what is in it. Wh
 - **admin:** a key in the `admins` list your home sends with its member list. Everything but `erase`. A home that
   sends no `admins` has none. When the home can't be reached, the last good list of admins stays.
 
-Anyone else, members included, gets 401.
+Anyone else, members included, gets 401. The signature is checked before anything about the key, and every
+refusal after a good signature reads `{"error": "this key may not manage this box"}`, an admin calling `erase`
+included. So no answer tells someone who can't sign as a key whether that key is the owner or an admin (your home
+keeps its admin list private).
 
 ### Request
 
@@ -209,7 +212,7 @@ params). Every other status also has a JSON body `{"error": "…"}`:
 
 | Status | When |
 |---|---|
-| 401 | no or bad `Authorization`, a key that may not manage this box, or an admin calling `erase` |
+| 401 | no or bad `Authorization` (the reason says what is wrong with it, the same whoever it names), or a good signature from a key that may not do this: always `this key may not manage this box` |
 | 400 | the body isn't `{"method": "...", "params": [...]}` |
 | 405 | not POST (`/manage`) or not GET (`/manage/info`) |
 | 413 | the body is over 64 KiB |

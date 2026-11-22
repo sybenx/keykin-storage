@@ -25,6 +25,8 @@ export const MAX_HASHES = 500;
 export const MAX_BIN_ITEMS = 5000;
 const DAY = 86400;
 const SHA256 = /^[0-9a-f]{64}$/;
+/** The one answer for a good signature from a key that may not do what it asked, whatever its role. */
+const NOT_ALLOWED = 'this key may not manage this box';
 
 type Role = 'owner' | 'admin';
 
@@ -109,7 +111,7 @@ export function manager(o: ManageOptions) {
       const role = await signer(req, body);
       const allowed = METHODS[call.method];
       if (!allowed) return send(res, 200, { error: 'unknown method' });
-      if (!allowed.includes(role)) throw new Refusal(401, `only the owner of this box may ${call.method}`);
+      if (!allowed.includes(role)) throw new Refusal(401, NOT_ALLOWED); // the same words as for a stranger
       return send(res, 200, run(call.method, call.params));
     } catch (err) {
       if (!(err instanceof Refusal)) {
@@ -123,20 +125,22 @@ export function manager(o: ManageOptions) {
   }
 
   /**
-   * The signer's role. A key that may not manage this box is refused before its signature is checked, so strangers
-   * cost one lookup (and, at most once a minute overall, a fresh look at the home's list).
+   * The signer's role. Unlike uploads, the signature is checked first: the home keeps its admin list private, so
+   * whether a key has a role here must not show in any answer to someone who can't sign as that key. Every refusal
+   * before the signature depends only on the request; every refusal after it is the same NOT_ALLOWED. The per-address
+   * limit bounds what the signature checks cost. Only a good signature may make storage ask the home again.
    */
   async function signer(req: http.IncomingMessage, body: Buffer): Promise<Role> {
     const p = parseAuth(req.headers.authorization, HTTP_AUTH_KIND);
     if (!p.ok) throw new Refusal(p.status, p.reason);
-    let role = roleOf(p.event.pubkey);
-    if (!role && o.home) {
-      await o.home.lookUp(); // maybe an admin the home just added
-      role = roleOf(p.event.pubkey);
-    }
-    if (!role) throw new Refusal(401, 'this key may not manage this box');
     const r = checkHttpAuth(p.event, { urls, method: 'POST', body }, o.now());
     if (!r.ok) throw new Refusal(r.status, r.reason);
+    let role = roleOf(r.pubkey);
+    if (!role && o.home) {
+      await o.home.lookUp(); // maybe an admin the home just added (at most once a minute overall)
+      role = roleOf(r.pubkey);
+    }
+    if (!role) throw new Refusal(401, NOT_ALLOWED);
     return role;
   }
 

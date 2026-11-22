@@ -206,8 +206,13 @@ in the README.
   its member list.
 - **Who.** Owner: `STORAGE_OWNER` or the owner the home reports. Admin: a key in the home's `admins` list, kept with
   the last good member list, so an unreachable home changes nothing. Admins may do everything but `erase`, which can't
-  be undone. With `STORAGE_HOME_URL` unset, the home's owner and admins have no role. A key with no role is refused before its signature is checked,
-  and a miss asks the home again at most once a minute, as for uploads.
+  be undone. With `STORAGE_HOME_URL` unset, the home's owner and admins have no role.
+- **Signature first, one refusal.** Unlike uploads, the signature is checked before the role: the home keeps its
+  admin list private (a public one would tie a person's messaging key to their main identity), so no answer may tell
+  someone who can't sign as a key whether it has a role. Refusals before the signature depend only on the request;
+  after a good signature every refusal, an admin's `erase` included, is the same 401 `this key may not manage this
+  box`. The per-address limit bounds the signature checks. Only a good signature from a key with no role asks the
+  home again (at most once a minute overall), so strangers can't make storage ask by naming keys.
 - **Cheap reads.** `usage` reads the account rows (their running totals) and one `totals` row that triggers keep on
   every blob insert and delete. `bin` reads the bin's index, newest first, capped at 5,000. `parked` reads removed
   members' totals, set when their files are parked and lowered by a trigger when a parked blob's row goes. Nothing

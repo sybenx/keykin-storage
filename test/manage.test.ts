@@ -26,6 +26,8 @@ interface SignOpts {
   kind?: number;
   /** Sign with this key's secret but claim `k`'s pubkey: a right id with a wrong signature. */
   wrongSig?: boolean;
+  /** Change the content after signing, so the id is wrong. */
+  badId?: boolean;
 }
 
 function sign(k: Key, body: string, now: number, o: SignOpts = {}): string {
@@ -33,6 +35,7 @@ function sign(k: Key, body: string, now: number, o: SignOpts = {}): string {
   const e: any = { pubkey: k.pk, created_at: o.createdAt ?? now, kind: o.kind ?? 27235, tags, content: '' };
   e.id = createHash('sha256').update(JSON.stringify([0, e.pubkey, e.created_at, e.kind, e.tags, e.content])).digest('hex');
   e.sig = Buffer.from(schnorr.sign(Buffer.from(e.id, 'hex'), o.wrongSig ? key().sk : k.sk)).toString('hex');
+  if (o.badId) e.content = 'changed';
   return 'Nostr ' + Buffer.from(JSON.stringify(e)).toString('base64');
 }
 
@@ -45,7 +48,7 @@ async function call(b: Box, k: Key | null, method: string, params: unknown[] = [
   const text = await r.text();
   let json: any = null;
   try { json = JSON.parse(text); } catch {}
-  return { status: r.status, json, headers: r.headers };
+  return { status: r.status, json, text, headers: r.headers };
 }
 
 const blobFile = (b: Box, x: string) => join(b.dir, 'blobs', x.slice(0, 2), x.slice(2, 4), x);
@@ -249,12 +252,17 @@ describe('the signature', () => {
     assert.match(r.json.error, /authorization required/);
   });
 
-  it('from a stranger is refused before its signature is checked', async () => {
+  it('is checked before the role, so a stranger hears about its signature first', async () => {
     const stranger = key();
-    for (const o of [{}, { wrongSig: true }, { u: 'https://other.test/manage', wrongSig: true }]) {
+    for (const [o, why] of [
+      [{ wrongSig: true }, 'authorization signature is wrong'],
+      [{ badId: true }, 'authorization id is wrong'],
+      [{ u: 'https://other.test/manage', wrongSig: true }, 'authorization is for another url'],
+      [{}, 'this key may not manage this box'],
+    ] as const) {
       const r = await call(b, stranger, 'usage', [], o);
       assert.equal(r.status, 401);
-      assert.equal(r.json.error, 'this key may not manage this box');
+      assert.equal(r.json.error, why);
     }
   });
 
@@ -381,14 +389,30 @@ describe("the home's owner and admins", () => {
     assert.equal((await call(s.b, admin, 'bin')).json.result.items[0].charged, member.pk);
     assert.deepEqual((await call(s.b, admin, 'restore', [[sha(x)]])).json, { result: { restored: 1 } });
     const r = await call(s.b, admin, 'erase', [[sha(x)]]);
-    assert.equal(r.status, 401);
-    assert.equal(r.json.error, 'only the owner of this box may erase');
+    const stranger = await call(s.b, key(), 'erase', [[sha(x)]]);
+    // word for word what a stranger hears, so nothing in the answer says the caller is an admin
+    assert.deepEqual([r.status, r.text], [401, JSON.stringify({ error: 'this key may not manage this box' })]);
+    assert.deepEqual([stranger.status, stranger.text], [r.status, r.text]);
     assert.notEqual(s.b.run.db.blob(sha(x)), null);
     assert.equal(existsSync(blobFile(s.b, sha(x))), true);
   });
 
-  it("an admin's bad signature is still refused", async () => {
-    assert.equal((await call(s.b, admin, 'usage', [], { wrongSig: true })).status, 401);
+  it('a bad signature gets the same answer whoever it names, and never makes storage ask the home', async () => {
+    s.b.clock.now += 61; // past the lookup interval: a miss could ask the home now
+    const calls = s.home.calls;
+    for (const o of [{ wrongSig: true }, { badId: true }, { createdAt: s.b.clock.now - 120 }] as SignOpts[]) {
+      const answers = [];
+      for (const k of [s.b.owner, homeOwner, admin, member, key()]) {
+        const r = await call(s.b, k, 'usage', [], o);
+        answers.push([r.status, r.text, r.headers.get('content-type')]);
+      }
+      assert.equal(answers[0][0], 401);
+      for (const a of answers) assert.deepEqual(a, answers[0]);
+    }
+    assert.equal(s.home.calls, calls);
+    // a good signature from a key with no role does ask (at most once a minute)
+    assert.equal((await call(s.b, key(), 'usage')).status, 401);
+    assert.equal(s.home.calls, calls + 1);
   });
 
   it('a member of the home may not manage', async () => {
