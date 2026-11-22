@@ -232,6 +232,8 @@ CORS is open (`*`), with `Authorization` allowed, and the preflight answers 204.
 | `restore [[sha256, ...]]` | owner, admin | `{restored: n}` |
 | `erase [[sha256, ...]]` | owner | `{erased: n}` |
 
+- `erase` removes any file on this box by its hash, whoever holds it and whether or not it is in the bin, the
+  same as the command-line `erase`. A page should only ever send hashes it read from `bin`.
 - Bytes are numbers of bytes, times are Unix seconds, pubkeys are hex.
 - `disk`: the data volume's used and free bytes (null if the box can't read them). `total`: every blob stored, the
   binned ones too, by real size.
