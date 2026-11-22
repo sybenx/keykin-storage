@@ -13,8 +13,19 @@ export interface Config {
   domains: string[];
   /** The box owner's pubkey (hex), or '' when not set up yet. Their account has no quota. */
   owner: string;
-  /** Largest blob, in bytes. */
+  /** Largest blob, in bytes, however it arrives (in one request or in pieces). */
   maxBlobBytes: number;
+  /**
+   * Largest body one request may carry, in bytes: `PUT /upload` and `/mirror`. Bigger files come in pieces
+   * (`POST /uploads`). Defaults to 256 MiB, or `maxBlobBytes` when that is smaller.
+   */
+  maxRequestBytes?: number;
+  /** Size of each piece of an upload in pieces, in bytes (the last piece is the remainder). Default 8 MiB. */
+  pieceBytes?: number;
+  /** Tests only: most uploads in pieces open at once per account (default 2)… */
+  maxOpenUploadsPerAccount?: number;
+  /** …and on the whole box (default 32). */
+  maxOpenUploads?: number;
   /** Most blobs an account with a quota may hold. */
   maxBlobsPerAccount: number;
   /** Days a blob nobody owns stays in the bin before it's erased. */
@@ -51,6 +62,14 @@ export interface Config {
 }
 
 const MiB = 1024 * 1024;
+/** Largest blob by default: 16 GiB, room for long phone video. */
+export const DEFAULT_MAX_BLOB_MB = 16 * 1024;
+/** Largest single request by default: what one request carried before uploads in pieces. */
+export const DEFAULT_MAX_REQUEST_MB = 256;
+/** Piece size by default: well under Cloudflare's 100 MB request cap, and little to send again after a drop. */
+export const DEFAULT_PIECE_MB = 8;
+/** Largest piece size allowed: under Cloudflare's 100 MB request cap with room to spare. */
+export const MAX_PIECE_MB = 64;
 
 /**
  * A size like 10G, 500M, 5.5T or 123 (bytes; K, M, G, T are powers of 1000, a trailing B is allowed), or null for
@@ -128,6 +147,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
   const rawOwner = (env.STORAGE_OWNER ?? '').trim();
   const owner = rawOwner ? parsePubkey(rawOwner) : '';
   if (owner === null) throw new Error('STORAGE_OWNER is not an npub or a hex pubkey');
+  const maxBlobBytes = Math.floor(number(env, 'STORAGE_MAX_BLOB_MB', DEFAULT_MAX_BLOB_MB) * MiB);
   return {
     dataDir: env.STORAGE_DIR || './data',
     host: env.STORAGE_ADDR || '0.0.0.0',
@@ -135,7 +155,9 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     publicUrl,
     domains: env.STORAGE_DOMAINS ? env.STORAGE_DOMAINS.split(',').map((d) => d.trim().toLowerCase()).filter(Boolean) : host ? [host] : [],
     owner,
-    maxBlobBytes: Math.floor(number(env, 'STORAGE_MAX_BLOB_MB', 256) * MiB),
+    maxBlobBytes,
+    maxRequestBytes: Math.min(maxBlobBytes, Math.floor(number(env, 'STORAGE_MAX_REQUEST_MB', DEFAULT_MAX_REQUEST_MB) * MiB)),
+    pieceBytes: Math.floor(number(env, 'STORAGE_PIECE_MB', DEFAULT_PIECE_MB, { integer: true, max: MAX_PIECE_MB }) * MiB),
     maxBlobsPerAccount: number(env, 'STORAGE_MAX_BLOBS', 200_000, { integer: true }),
     binDays: number(env, 'STORAGE_BIN_DAYS', 30),
     mirrorTimeoutMs: number(env, 'STORAGE_MIRROR_TIMEOUT_S', 120) * 1000,

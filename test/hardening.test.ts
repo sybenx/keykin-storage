@@ -432,7 +432,7 @@ describe('10. the account check and the ownership write are one transaction', ()
 describe('11. numeric settings are checked', () => {
   it('refuses a value that is not a positive number, naming the setting', async () => {
     const { configFromEnv } = await import('../src/config.ts');
-    for (const name of ['STORAGE_MAX_BLOB_MB', 'STORAGE_BIN_DAYS', 'STORAGE_MIRROR_TIMEOUT_S', 'STORAGE_MAX_BLOBS', 'STORAGE_PORT']) {
+    for (const name of ['STORAGE_MAX_BLOB_MB', 'STORAGE_MAX_REQUEST_MB', 'STORAGE_PIECE_MB', 'STORAGE_BIN_DAYS', 'STORAGE_MIRROR_TIMEOUT_S', 'STORAGE_MAX_BLOBS', 'STORAGE_PORT']) {
       for (const bad of ['256M', '0', '-5', 'Infinity', 'NaN', '1e400', 'ten']) {
         assert.throws(() => configFromEnv({ [name]: bad }), new RegExp(name), `${name}=${bad}`);
       }
@@ -440,7 +440,12 @@ describe('11. numeric settings are checked', () => {
     assert.throws(() => configFromEnv({ STORAGE_PORT: '70000' }), /STORAGE_PORT/);
     assert.throws(() => configFromEnv({ STORAGE_MAX_BLOBS: '10.5' }), /STORAGE_MAX_BLOBS/);
     const c = configFromEnv({ STORAGE_MAX_BLOB_MB: '', STORAGE_BIN_DAYS: ' 7 ', STORAGE_PORT: '8080' });
-    assert.equal(c.maxBlobBytes, 256 * 1024 * 1024);
+    assert.equal(c.maxBlobBytes, 16 * 1024 * 1024 * 1024);
+    assert.equal(c.maxRequestBytes, 256 * 1024 * 1024);
+    assert.equal(c.pieceBytes, 8 * 1024 * 1024);
+    assert.throws(() => configFromEnv({ STORAGE_PIECE_MB: '65' }), /STORAGE_PIECE_MB/);
+    assert.throws(() => configFromEnv({ STORAGE_PIECE_MB: '1.5' }), /STORAGE_PIECE_MB/);
+    assert.equal(configFromEnv({ STORAGE_MAX_BLOB_MB: '100' }).maxRequestBytes, 100 * 1024 * 1024);
     assert.equal(c.binDays, 7);
     assert.equal(c.port, 8080);
   });

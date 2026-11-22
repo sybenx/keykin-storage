@@ -65,6 +65,11 @@ export interface Running {
 
 export async function start(config: Config, opts: { homeSource?: HomeSource } = {}): Promise<Running> {
   const now = config.now ?? (() => Math.floor(Date.now() / 1000));
+  /** Largest body of one request (PUT /upload, /mirror); bigger files come in pieces. */
+  const maxRequest = Math.min(config.maxRequestBytes ?? 256 * 1024 * 1024, config.maxBlobBytes);
+  const tooBig = () => new HttpError(413, maxRequest < config.maxBlobBytes
+    ? `one request here carries at most ${maxRequest} bytes; send bigger files in pieces (POST /uploads)`
+    : `blobs here are at most ${config.maxBlobBytes} bytes`);
   const log = config.log ?? ((line: string) => console.log(line));
   const db = new Db(join(config.dataDir, 'storage.db'), { maxBlobs: config.maxBlobsPerAccount });
   const store = new Store(config.dataDir);
@@ -254,7 +259,7 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
     const len = req.headers['content-length'];
     if (!len || !/^\d+$/.test(len)) throw new HttpError(411, 'content-length required');
     const size = Number(len);
-    if (size > config.maxBlobBytes) throw new HttpError(413, `blobs here are at most ${config.maxBlobBytes} bytes`);
+    if (size > maxRequest) throw tooBig();
     const claimed = header(req, 'x-sha-256')?.toLowerCase() ?? null;
     if (claimed && !auth.xs.includes(claimed)) throw new HttpError(403, 'x-sha-256 is not in the authorization');
     mustFit(account, auth.xs, size);
@@ -306,14 +311,14 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
 
   async function receive(body: Readable, declared: number | null, rate?: MinRate): Promise<Received> {
     try {
-      const got = await store.receive(body, config.maxBlobBytes, rate);
+      const got = await store.receive(body, maxRequest, rate);
       if (declared !== null && got.size !== declared) {
         store.discard(got.tmp);
         throw new HttpError(400, 'body length does not match content-length');
       }
       return got;
     } catch (err) {
-      if (err instanceof TooLarge) throw new HttpError(413, `blobs here are at most ${config.maxBlobBytes} bytes`);
+      if (err instanceof TooLarge) throw tooBig();
       if (err instanceof Aborted) throw new HttpError(400, 'upload aborted');
       if (err instanceof TooSlow) throw new HttpError(408, 'upload too slow: under 16 KiB a second for a minute');
       throw err;
@@ -330,7 +335,7 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
     if (!sha || !/^[0-9a-f]{64}$/.test(sha)) throw new HttpError(400, 'x-sha-256 required');
     if (!auth.xs.includes(sha)) throw new HttpError(403, 'x-sha-256 is not in the authorization');
     const size = Number(len);
-    if (size > config.maxBlobBytes) throw new HttpError(413, `blobs here are at most ${config.maxBlobBytes} bytes`);
+    if (size > maxRequest) throw tooBig();
     mustFit(account, [sha], size);
     end(res, 200);
   }
@@ -366,10 +371,10 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
       const src = await guardedFetch(url, { timeoutMs: config.mirrorTimeoutMs, allowPrivate: config.mirrorAllowPrivate }, signal);
       type = src.type;
       // the source's length if it says, else the cap (the body is cut off there either way)
-      const size = src.length ?? config.maxBlobBytes;
-      if (size > config.maxBlobBytes) {
+      const size = src.length ?? maxRequest;
+      if (size > maxRequest) {
         src.body.destroy();
-        throw new HttpError(413, `blobs here are at most ${config.maxBlobBytes} bytes`);
+        throw tooBig();
       }
       if (src.length !== null) {
         try {
