@@ -139,7 +139,12 @@ export async function start(config: Config): Promise<Running> {
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     cors(res);
     const method = req.method ?? 'GET';
-    const path = new URL(req.url ?? '/', 'http://x').pathname;
+    let path: string;
+    try {
+      path = new URL(req.url ?? '/', 'http://x').pathname;
+    } catch {
+      return fail(res, 400, 'bad request', method === 'HEAD'); // a request line no url can be read from: not worth a log
+    }
     if (method === 'OPTIONS') return end(res, 204);
     if (req.headers.authorization !== undefined && !limit.take(clientAddress(req, config.behindCloudflare))) {
       return fail(res, 429, 'too many signed requests from your address; wait a few seconds', method === 'HEAD');

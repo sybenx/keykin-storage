@@ -359,3 +359,26 @@ describe('8. only images, video and audio are served inline', () => {
     }
   });
 });
+
+describe('9. a malformed request line is a quiet 400', () => {
+  let b: Box;
+  before(async () => { b = await box(); });
+  after(() => b.close());
+
+  it('answers 400 and logs nothing', async (t) => {
+    const logged = t.mock.method(console, 'error', () => {});
+    const net = await import('node:net');
+    const port = Number(new URL(b.url).port);
+    for (const line of ['GET // HTTP/1.1', 'GET http://[::1 HTTP/1.1', 'GET /ÿ HTTP/1.1']) {
+      const answer = await new Promise<string>((resolve) => {
+        const s = net.connect(port, '127.0.0.1', () => s.write(`${line}\r\nHost: x\r\nConnection: close\r\n\r\n`));
+        let got = '';
+        s.on('data', (c) => { got += c; });
+        s.on('close', () => resolve(got));
+        s.on('error', () => resolve(got));
+      });
+      assert.match(answer, /^HTTP\/1\.1 400/, line);
+    }
+    assert.equal(logged.mock.callCount(), 0);
+  });
+});
