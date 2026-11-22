@@ -39,7 +39,7 @@ try {
   switch (cmd) {
     case 'accounts':
       for (const acc of db.accounts()) {
-        console.log(`${npub(acc.pubkey)}  ${size(db.usage(acc.pubkey))} of ${acc.quota === null ? 'unlimited' : size(acc.quota)}`);
+        console.log(`${npub(acc.pubkey)}  ${size(acc.used)} of ${acc.quota === null ? 'unlimited' : size(acc.quota)}`);
       }
       break;
     case 'add':

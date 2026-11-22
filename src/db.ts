@@ -17,7 +17,26 @@ export interface Account {
   /** Bytes, or null for no limit (the box owner). */
   quota: number | null;
   added: number;
+  /** Bytes charged to the account, kept up to date in the same transactions that change ownership. */
+  used: number;
+  /** Blobs charged to the account. */
+  blobs: number;
 }
+
+const ACCOUNT_COLS = 'a.pubkey, a.quota, a.added, a.used, a.blobs';
+
+/**
+ * Schema changes after 0.1.0, in order. `PRAGMA user_version` says how many have run. Each runs once, in a
+ * transaction, on a new database as well as an old one.
+ */
+const MIGRATIONS: ((db: Db) => void)[] = [
+  // 0.2.0: running totals per account, so a quota check doesn't sum every blob the account holds
+  (db) => {
+    db.sql.exec('ALTER TABLE accounts ADD COLUMN used INTEGER NOT NULL DEFAULT 0');
+    db.sql.exec('ALTER TABLE accounts ADD COLUMN blobs INTEGER NOT NULL DEFAULT 0');
+    db.recountAll();
+  },
+];
 
 export interface Owned extends Blob {
   uploaded: number;
@@ -49,6 +68,17 @@ export class Db {
       CREATE INDEX IF NOT EXISTS owners_by_key ON owners(key, uploaded, sha256);
       CREATE INDEX IF NOT EXISTS blobs_binned ON blobs(binned) WHERE binned IS NOT NULL;
     `);
+    this.migrate();
+  }
+
+  private migrate(): void {
+    const version = () => Number(this.sql.prepare('PRAGMA user_version').get()!.user_version);
+    if (version() >= MIGRATIONS.length) return;
+    this.tx(() => {
+      // the CLI and the server may open the database at the same time: check again under the write lock
+      for (let v = version(); v < MIGRATIONS.length; v++) MIGRATIONS[v](this);
+      this.sql.exec(`PRAGMA user_version = ${MIGRATIONS.length}`);
+    });
   }
 
   close(): void {
@@ -75,6 +105,8 @@ export class Db {
       this.sql.prepare('INSERT INTO accounts (pubkey, quota, added) VALUES (?, ?, ?) ON CONFLICT(pubkey) DO UPDATE SET quota = excluded.quota')
         .run(pubkey, quota, now);
       this.sql.prepare('INSERT OR IGNORE INTO keys (key, account) VALUES (?, ?)').run(pubkey, pubkey);
+      // a new account may have blobs it let go of before it was removed, still in the bin on its name
+      this.recount(pubkey);
     });
   }
 
@@ -91,21 +123,49 @@ export class Db {
   }
 
   accounts(): Account[] {
-    return this.sql.prepare('SELECT pubkey, quota, added FROM accounts ORDER BY added').all() as unknown as Account[];
+    return this.sql.prepare(`SELECT ${ACCOUNT_COLS} FROM accounts a ORDER BY a.added`).all() as unknown as Account[];
   }
 
   /** The account a key writes for, or null if it may not write here. */
   accountOf(key: string): Account | null {
-    const r = this.sql.prepare('SELECT a.pubkey, a.quota, a.added FROM keys k JOIN accounts a ON a.pubkey = k.account WHERE k.key = ?').get(key);
+    const r = this.sql.prepare(`SELECT ${ACCOUNT_COLS} FROM keys k JOIN accounts a ON a.pubkey = k.account WHERE k.key = ?`).get(key);
     return (r as unknown as Account) ?? null;
   }
 
-  /** Bytes charged to an account: each blob any of its keys owns, once, plus what it last let go of that's still in the bin. */
-  usage(account: string): number {
-    const r = this.sql.prepare(`SELECT COALESCE(SUM(size), 0) AS n FROM blobs WHERE sha256 IN
+  /** The account a key writes for, by pubkey only. */
+  private accountKey(key: string): string | null {
+    return (this.sql.prepare('SELECT account FROM keys WHERE key = ?').get(key)?.account as string) ?? null;
+  }
+
+  /**
+   * Counts what an account is charged from scratch: each blob any of its keys owns, once, plus what it last let go
+   * of that's still in the bin. O(blobs): only for checks, the upgrade and accounts being added.
+   */
+  count(account: string): { used: number; blobs: number } {
+    const r = this.sql.prepare(`SELECT COALESCE(SUM(size), 0) AS used, COUNT(*) AS blobs FROM blobs WHERE sha256 IN
       (SELECT o.sha256 FROM owners o JOIN keys k ON k.key = o.key WHERE k.account = ?)
       OR (binned IS NOT NULL AND binned_by = ?)`).get(account, account);
-    return Number(r!.n);
+    return { used: Number(r!.used), blobs: Number(r!.blobs) };
+  }
+
+  /** Bytes charged to an account, counted from scratch (see `count`). The running total is `Account.used`. */
+  usage(account: string): number {
+    return this.count(account).used;
+  }
+
+  /** Sets an account's running totals from a full count. */
+  recount(account: string): void {
+    const c = this.count(account);
+    this.sql.prepare('UPDATE accounts SET used = ?, blobs = ? WHERE pubkey = ?').run(c.used, c.blobs, account);
+  }
+
+  recountAll(): void {
+    for (const r of this.sql.prepare('SELECT pubkey FROM accounts').all()) this.recount(r.pubkey as string);
+  }
+
+  /** Adds (`sign` 1) or takes off (-1) one blob of `size` bytes from an account's running totals. */
+  private charge(account: string, size: number, sign: 1 | -1): void {
+    this.sql.prepare('UPDATE accounts SET used = used + ?, blobs = blobs + ? WHERE pubkey = ?').run(sign * size, sign, account);
   }
 
   /** Whether any key of the account owns the blob. */
@@ -119,11 +179,14 @@ export class Db {
       !!this.sql.prepare('SELECT 1 FROM blobs WHERE sha256 = ? AND binned IS NOT NULL AND binned_by = ?').get(sha256, account);
   }
 
-  /** Whether `size` more bytes for this blob fit in the account's quota, with `pending` bytes of uploads in flight. */
+  /**
+   * Whether `size` more bytes for this blob fit in the account's quota, with `pending` bytes of uploads in flight.
+   * Uses the running total on `account`, so read the account once per request and pass it in.
+   */
   fits(account: Account, sha256: string | null, size: number, pending = 0): boolean {
     if (account.quota === null) return true;
     if (sha256 && this.charged(account.pubkey, sha256)) return true;
-    return this.usage(account.pubkey) + pending + size <= account.quota;
+    return account.used + pending + size <= account.quota;
   }
 
   /** When `key` took its copy, or null. */
@@ -147,9 +210,16 @@ export class Db {
   own(sha256: string, size: number, type: string, key: string, now: number): boolean {
     return this.tx(() => {
       const had = this.blob(sha256);
+      const account = this.accountKey(key);
+      const was = account !== null && this.charged(account, sha256);
+      const binnedBy = had && had.binned !== null ? this.binnedBy(sha256) : null;
       if (!had) this.sql.prepare('INSERT INTO blobs (sha256, size, type, created, binned) VALUES (?, ?, ?, ?, NULL)').run(sha256, size, type, now);
       else if (had.binned !== null) this.sql.prepare('UPDATE blobs SET binned = NULL, binned_by = NULL WHERE sha256 = ?').run(sha256);
       this.sql.prepare('INSERT OR IGNORE INTO owners (sha256, key, uploaded) VALUES (?, ?, ?)').run(sha256, key, now);
+      const cost = had ? had.size : size;
+      if (account !== null && !was) this.charge(account, cost, 1);
+      // out of the bin: off the quota of whoever let go of it last, unless that's this account
+      if (binnedBy !== null && binnedBy !== account) this.charge(binnedBy, cost, -1);
       return !had;
     });
   }
@@ -160,12 +230,18 @@ export class Db {
   }
 
   private letGo(sha256: string, key: string, now: number): boolean {
+    const account = this.accountKey(key);
+    const was = account !== null && this.charged(account, sha256);
     const gone = this.sql.prepare('DELETE FROM owners WHERE sha256 = ? AND key = ?').run(sha256, key).changes > 0;
     if (gone && !this.sql.prepare('SELECT 1 FROM owners WHERE sha256 = ?').get(sha256)) {
-      const acc = this.sql.prepare('SELECT account FROM keys WHERE key = ?').get(key);
-      this.sql.prepare('UPDATE blobs SET binned = ?, binned_by = ? WHERE sha256 = ?').run(now, (acc?.account as string) ?? null, sha256);
+      this.sql.prepare('UPDATE blobs SET binned = ?, binned_by = ? WHERE sha256 = ?').run(now, account, sha256);
     }
+    if (gone && was && !this.charged(account!, sha256)) this.charge(account!, this.blob(sha256)!.size, -1);
     return gone;
+  }
+
+  private binnedBy(sha256: string): string | null {
+    return (this.sql.prepare('SELECT binned_by FROM blobs WHERE sha256 = ?').get(sha256)?.binned_by as string) ?? null;
   }
 
   /** Blobs `key` owns, newest first. `cursor` is the last sha256 of the previous page. */
@@ -195,6 +271,13 @@ export class Db {
 
   /** Erases a blob's row if it is still binned since before `before`. Returns whether it did. */
   erase(sha256: string, before: number): boolean {
-    return this.sql.prepare('DELETE FROM blobs WHERE sha256 = ? AND binned IS NOT NULL AND binned < ?').run(sha256, before).changes > 0;
+    return this.tx(() => {
+      const b = this.blob(sha256);
+      if (!b || b.binned === null || b.binned >= before) return false;
+      const by = this.binnedBy(sha256);
+      this.sql.prepare('DELETE FROM blobs WHERE sha256 = ?').run(sha256);
+      if (by !== null) this.charge(by, b.size, -1);
+      return true;
+    });
   }
 }

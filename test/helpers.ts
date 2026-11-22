@@ -10,6 +10,8 @@ import { start, type Running } from '../src/server.ts';
 
 export const DOMAIN = 'storage.test';
 
+export const tempDir = () => mkdtempSync(join(tmpdir(), 'keykin-storage-test-'));
+
 export interface Key {
   sk: Uint8Array;
   pk: string;
@@ -55,9 +57,9 @@ export interface Box {
 }
 
 /** A server on a free loopback port, in a temp folder, with a settable clock. Close it in after(). */
-export async function box(over: Partial<Config> = {}): Promise<Box> {
-  const dir = mkdtempSync(join(tmpdir(), 'keykin-storage-test-'));
-  const owner = key();
+export async function box(over: Partial<Config> = {}, opts: { dir?: string; owner?: Key } = {}): Promise<Box> {
+  const dir = opts.dir ?? tempDir();
+  const owner = opts.owner ?? key();
   const clock = { now: Math.floor(Date.now() / 1000) };
   const run = await start({
     dataDir: dir, host: '127.0.0.1', port: 0, publicUrl: `https://${DOMAIN}`, domains: [DOMAIN], owner: owner.pk,

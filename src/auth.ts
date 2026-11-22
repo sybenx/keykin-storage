@@ -18,6 +18,8 @@ const H64 = HEX(64), H128 = HEX(128);
 /** A signature can't be from the future by more than this (clock skew), seconds. */
 const SKEW = 60;
 const MAX_HEADER = 16 * 1024;
+/** Most `x` tags one authorization may carry. Each is a database lookup per request. */
+export const MAX_X_TAGS = 16;
 
 const fail = (reason: string): AuthResult => ({ ok: false, status: 401, reason });
 
@@ -64,5 +66,6 @@ export function readAuth(header: string | undefined, verb: Verb, domains: string
   if (servers.length === 0) return fail('authorization needs a server tag');
   if (!servers.some((s) => domains.includes(s))) return fail('authorization is for another server');
   const xs = tags('x').map((x) => x.toLowerCase()).filter((x) => H64.test(x));
+  if (xs.length > MAX_X_TAGS) return fail(`authorization has more than ${MAX_X_TAGS} x tags`);
   return { ok: true, auth: { pubkey: e.pubkey, xs } };
 }
