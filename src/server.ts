@@ -589,8 +589,8 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
     const len = req.headers['content-length'];
     if (!len || !/^\d+$/.test(len)) throw new HttpError(411, 'content-length required');
     if (Number(len) !== expected) throw new HttpError(400, `piece ${index} must be ${expected} bytes`);
-    const claimed = header(req, 'x-piece-sha256')?.toLowerCase() ?? null;
-    if (claimed !== null && !/^[0-9a-f]{64}$/.test(claimed)) throw new HttpError(400, 'x-piece-sha256 must be 64 hex characters');
+    const claimed = header(req, 'x-piece-sha-256')?.toLowerCase() ?? null;
+    if (claimed !== null && !/^[0-9a-f]{64}$/.test(claimed)) throw new HttpError(400, 'x-piece-sha-256 must be 64 hex characters');
     if (completing.has(u.id)) throw new HttpError(409, 'this upload is being completed');
 
     const slot = take(account, { blob: false });
@@ -626,7 +626,7 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
     }
     res.removeHeader('connection'); // the body is read: the connection can carry the next piece
     if (got.size !== expected) throw new HttpError(400, `piece ${index} must be ${expected} bytes`);
-    if (claimed !== null && got.sha256 !== claimed) throw new HttpError(400, 'piece does not match x-piece-sha256');
+    if (claimed !== null && got.sha256 !== claimed) throw new HttpError(400, 'piece does not match x-piece-sha-256');
     if (!db.markPiece(u.id, index, expected, now())) throw new HttpError(404, NO_UPLOAD);
     json(res, 200, statusOf(db.upload(u.id)!));
   }

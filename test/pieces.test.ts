@@ -185,15 +185,15 @@ describe('uploads in pieces: the happy paths', () => {
     assert.equal((await client(b, b.owner).complete(s.id, sha(file))).status, 201);
   });
 
-  it('checks a piece against x-piece-sha256 when sent', async () => {
+  it('checks a piece against x-piece-sha-256 when sent', async () => {
     const file = randomBytes(2 * PIECE);
     const s = await open(b, b.owner, file);
     const p = cut(file);
-    const bad = await client(b, b.owner).piece(s.id, sha(file), 0, p[0], { 'x-piece-sha256': sha(p[1]) });
+    const bad = await client(b, b.owner).piece(s.id, sha(file), 0, p[0], { 'x-piece-sha-256': sha(p[1]) });
     assert.equal(bad.status, 400);
-    assert.equal(reason(bad), 'piece does not match x-piece-sha256');
+    assert.equal(reason(bad), 'piece does not match x-piece-sha-256');
     assert.deepEqual((await (await client(b, b.owner).status(s.id, sha(file))).json() as any).received, []);
-    assert.equal((await client(b, b.owner).piece(s.id, sha(file), 0, p[0], { 'x-piece-sha256': sha(p[0]) })).status, 200);
+    assert.equal((await client(b, b.owner).piece(s.id, sha(file), 0, p[0], { 'x-piece-sha-256': sha(p[0]) })).status, 200);
     assert.equal((await client(b, b.owner).cancel(s.id, sha(file))).status, 204);
   });
 
