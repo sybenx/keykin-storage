@@ -4,7 +4,13 @@ import { configFromEnv } from './config.ts';
 import { npub } from './keys.ts';
 import { start } from './server.ts';
 
-const config = configFromEnv();
+let config: ReturnType<typeof configFromEnv>;
+try {
+  config = configFromEnv();
+} catch (err) {
+  console.error(`keykin-storage: not starting: ${(err as Error).message}`);
+  process.exit(1);
+}
 const running = await start(config);
 console.log(config.owner && config.publicUrl
   ? `keykin-storage on ${config.host}:${config.port}, ${config.publicUrl}, owner ${npub(config.owner)}`

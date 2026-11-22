@@ -42,6 +42,20 @@ export interface Config {
 
 const MiB = 1024 * 1024;
 
+/**
+ * A numeric setting: unset or empty gives `fallback`; otherwise it must be a positive finite number (a whole one
+ * when `integer`), or it's an error naming the setting. A typo like `256M` must not quietly remove a cap.
+ */
+function number(env: NodeJS.ProcessEnv, name: string, fallback: number, opts: { integer?: boolean; max?: number } = {}): number {
+  const raw = (env[name] ?? '').trim();
+  if (raw === '') return fallback;
+  const n = /^\d+(\.\d+)?$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isFinite(n) || n <= 0 || (opts.integer && !Number.isInteger(n)) || (opts.max !== undefined && n > opts.max)) {
+    throw new Error(`${name} must be a positive ${opts.integer ? 'whole ' : ''}number${opts.max !== undefined ? ` up to ${opts.max}` : ''}, not "${raw}"`);
+  }
+  return n;
+}
+
 /** A yes/no setting: true, yes, 1 or false, no, 0 (empty is no). Anything else is an error naming the setting. */
 function flag(env: NodeJS.ProcessEnv, name: string): boolean {
   const v = (env[name] ?? '').trim().toLowerCase();
@@ -52,7 +66,8 @@ function flag(env: NodeJS.ProcessEnv, name: string): boolean {
 
 /**
  * Reads the settings. A box installed before it's set up (no STORAGE_PUBLIC_URL or STORAGE_OWNER) still starts:
- * it serves reads and refuses every write with 503 until both are set. Malformed values are errors.
+ * it serves reads and refuses every write with 503 until both are set. Malformed values are errors that name
+ * the setting, and the server does not start.
  */
 export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
   const publicUrl = (env.STORAGE_PUBLIC_URL ?? '').trim().replace(/\/+$/, '');
@@ -68,14 +83,14 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     dataDir: env.STORAGE_DIR || './data',
     host: env.STORAGE_ADDR || '0.0.0.0',
-    port: Number(env.STORAGE_PORT || 7480),
+    port: number(env, 'STORAGE_PORT', 7480, { integer: true, max: 65535 }),
     publicUrl,
     domains: env.STORAGE_DOMAINS ? env.STORAGE_DOMAINS.split(',').map((d) => d.trim().toLowerCase()).filter(Boolean) : host ? [host] : [],
     owner,
-    maxBlobBytes: Number(env.STORAGE_MAX_BLOB_MB || 256) * MiB,
-    maxBlobsPerAccount: Number(env.STORAGE_MAX_BLOBS || 200_000),
-    binDays: Number(env.STORAGE_BIN_DAYS || 30),
-    mirrorTimeoutMs: Number(env.STORAGE_MIRROR_TIMEOUT_S || 120) * 1000,
+    maxBlobBytes: Math.floor(number(env, 'STORAGE_MAX_BLOB_MB', 256) * MiB),
+    maxBlobsPerAccount: number(env, 'STORAGE_MAX_BLOBS', 200_000, { integer: true }),
+    binDays: number(env, 'STORAGE_BIN_DAYS', 30),
+    mirrorTimeoutMs: number(env, 'STORAGE_MIRROR_TIMEOUT_S', 120) * 1000,
     behindCloudflare: flag(env, 'STORAGE_BEHIND_CLOUDFLARE'),
   };
 }
