@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import http from 'node:http';
@@ -94,4 +95,18 @@ export async function put(b: Box, k: Key, body: Uint8Array, extra: Partial<AuthO
     method: 'PUT', body,
     headers: { authorization: auth(k, { t: 'upload', x: [sha(body)], now: b.clock.now, ...extra }), 'content-type': 'application/octet-stream', ...headers },
   });
+}
+
+/** Runs the CLI against a data folder and returns what it printed. Throws (with its output) if it fails. */
+export function cli(dir: string, ...args: string[]): string;
+export function cli(dir: string, env: Record<string, string>, ...args: string[]): string;
+export function cli(dir: string, ...rest: unknown[]): string {
+  const env = typeof rest[0] === 'object' ? rest.shift() as Record<string, string> : {};
+  try {
+    return execFileSync(process.execPath, ['src/cli.ts', ...rest as string[]], {
+      env: { ...process.env, ...env, STORAGE_DIR: dir, NODE_NO_WARNINGS: '1' }, encoding: 'utf8', timeout: 20_000, stdio: 'pipe',
+    });
+  } catch (err: any) {
+    throw new Error(`cli ${rest.join(' ')} failed: ${err.stdout ?? ''}${err.stderr ?? ''}`);
+  }
 }

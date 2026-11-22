@@ -141,6 +141,26 @@ export class Db {
     });
   }
 
+  /**
+   * Removes an account and erases at once every blob only it holds: what its keys own that nobody else owns, and
+   * what it let go of that is still in the bin on its name. Returns the erased hashes (delete their files), or null
+   * when there is no such account.
+   */
+  purgeAccount(pubkey: string, now: number): string[] | null {
+    return this.tx(() => {
+      if (!this.sql.prepare('SELECT 1 FROM accounts WHERE pubkey = ?').get(pubkey)) return null;
+      const keys = this.sql.prepare('SELECT key FROM keys WHERE account = ?').all(pubkey).map((r) => r.key as string);
+      for (const k of keys) {
+        const shas = this.sql.prepare('SELECT sha256 FROM owners WHERE key = ?').all(k).map((r) => r.sha256 as string);
+        for (const s of shas) this.letGo(s, k, now);
+      }
+      const erased = this.sql.prepare('SELECT sha256 FROM blobs WHERE binned IS NOT NULL AND binned_by = ?').all(pubkey).map((r) => r.sha256 as string);
+      for (const s of erased) this.eraseRow(s);
+      this.sql.prepare('DELETE FROM accounts WHERE pubkey = ?').run(pubkey);
+      return erased;
+    });
+  }
+
   accounts(): Account[] {
     return this.sql.prepare(`SELECT ${ACCOUNT_COLS} FROM accounts a ORDER BY a.added`).all() as unknown as Account[];
   }
@@ -295,15 +315,32 @@ export class Db {
     return this.sql.prepare('SELECT sha256 FROM blobs WHERE binned IS NOT NULL AND binned < ?').all(before).map((r) => r.sha256 as string);
   }
 
+  /**
+   * Erases a blob's row now, whoever owns it (a take-down). Returns whether there was one. Delete the file after.
+   */
+  eraseNow(sha256: string): boolean {
+    return this.tx(() => this.eraseRow(sha256));
+  }
+
+  /** Deletes a blob's row and takes it off every account it was charged to. */
+  private eraseRow(sha256: string): boolean {
+    const b = this.blob(sha256);
+    if (!b) return false;
+    const charged = new Set(this.sql.prepare('SELECT DISTINCT k.account FROM owners o JOIN keys k ON k.key = o.key WHERE o.sha256 = ?')
+      .all(sha256).map((r) => r.account as string));
+    const by = b.binned !== null ? this.binnedBy(sha256) : null;
+    if (by !== null) charged.add(by);
+    this.sql.prepare('DELETE FROM blobs WHERE sha256 = ?').run(sha256);
+    for (const a of charged) this.charge(a, b.size, -1);
+    return true;
+  }
+
   /** Erases a blob's row if it is still binned since before `before`. Returns whether it did. */
   erase(sha256: string, before: number): boolean {
     return this.tx(() => {
       const b = this.blob(sha256);
       if (!b || b.binned === null || b.binned >= before) return false;
-      const by = this.binnedBy(sha256);
-      this.sql.prepare('DELETE FROM blobs WHERE sha256 = ?').run(sha256);
-      if (by !== null) this.charge(by, b.size, -1);
-      return true;
+      return this.eraseRow(sha256);
     });
   }
 }

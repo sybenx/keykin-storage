@@ -5,7 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
-import { auth, box, key, put, sha, tempDir, type Box } from './helpers.ts';
+import { auth, box, cli, key, put, sha, tempDir, type Box } from './helpers.ts';
 
 const DAY = 86400;
 
@@ -185,5 +185,49 @@ describe('3b. the rate limit itself', () => {
     assert.equal(l.take('a', 1000), true);
     for (let i = 0; i < 100; i++) l.take(`10.0.0.${i}`, 2000);
     assert.equal(l.size, 3);
+  });
+});
+
+describe('4. take-down: erase now, purge an account, short cache lifetime', () => {
+  let b: Box;
+  before(async () => { b = await box(); });
+  after(() => b.close());
+  const del = (k: typeof b.owner, x: string) =>
+    fetch(`${b.url}/${x}`, { method: 'DELETE', headers: { authorization: auth(k, { t: 'delete', x: [x], now: b.clock.now }) } });
+  const status = async (x: Uint8Array) => (await fetch(`${b.url}/${sha(x)}`)).status;
+
+  it('serves blobs with a one-day cache lifetime, not immutable', async () => {
+    const x = randomBytes(10);
+    await put(b, b.owner, x);
+    const cc = (await fetch(`${b.url}/${sha(x)}`)).headers.get('cache-control')!;
+    assert.equal(cc, 'public, max-age=86400');
+  });
+
+  it('erase <sha256> removes the row and the file at once, owned or binned', async () => {
+    const x = randomBytes(5000);
+    await put(b, b.owner, x);
+    assert.match(cli(b.dir, 'erase', sha(x)), /erased/);
+    assert.equal(await status(x), 404);
+    assert.equal(b.run.db.blob(sha(x)), null);
+    const { existsSync } = await import('node:fs');
+    assert.equal(existsSync(join(b.dir, 'blobs', sha(x).slice(0, 2), sha(x).slice(2, 4), sha(x))), false);
+    assert.equal(b.run.db.accountOf(b.owner.pk)!.used, b.run.db.usage(b.owner.pk));
+    assert.throws(() => cli(b.dir, 'erase', sha(x)), /not here/);
+  });
+
+  it('remove <npub> --purge erases what only that account holds, and leaves shared blobs', async () => {
+    const friend = key();
+    b.run.db.putAccount(friend.pk, 10 ** 9, b.clock.now);
+    const alone = randomBytes(100), shared = randomBytes(100), binned = randomBytes(100);
+    for (const x of [alone, shared, binned]) assert.equal((await put(b, friend, x)).status, 201);
+    await put(b, b.owner, shared);
+    assert.equal((await del(friend, sha(binned))).status, 204);
+    const out = cli(b.dir, 'remove', friend.pk, '--purge');
+    assert.match(out, /erased 2/);
+    assert.equal(await status(alone), 404);
+    assert.equal(await status(binned), 404);
+    assert.equal(await status(shared), 200);
+    assert.equal(b.run.db.accountOf(friend.pk), null);
+    assert.equal(b.run.db.uploadedAt(sha(shared), friend.pk), null);
   });
 });

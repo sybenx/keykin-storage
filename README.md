@@ -90,6 +90,21 @@ npm run accounts -- restore <sha256>
 
 Removing a friend lets go of everything their keys held. What nobody else holds goes to the bin.
 
+To take something down now, without the 30 days in the bin:
+
+```bash
+npm run accounts -- erase <sha256>
+```
+
+```bash
+npm run accounts -- remove npub1… --purge
+```
+
+`erase` removes one blob's record and file at once, whoever holds it. `remove --purge` removes the account and
+erases everything only that account holds (blobs someone else also holds stay). Blobs are served with a one-day
+cache lifetime, so after an erase also purge the blob's URL from your edge cache (on Cloudflare: Caching,
+Configuration, Purge by URL), or it may be served from there for up to a day.
+
 ## Tests
 
 ```bash

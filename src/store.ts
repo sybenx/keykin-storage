@@ -16,11 +16,25 @@ export interface Received {
   size: number;
 }
 
+/** Where a blob's file lives: <dataDir>/blobs/ab/cd/<sha256>. */
+export function blobPath(dataDir: string, sha256: string): string {
+  return join(dataDir, 'blobs', sha256.slice(0, 2), sha256.slice(2, 4), sha256);
+}
+
+/** Removes a blob's file, if it is there. For the CLI, which must not construct a Store (that empties tmp). */
+export function removeBlobFile(dataDir: string, sha256: string): void {
+  try {
+    unlinkSync(blobPath(dataDir, sha256));
+  } catch {}
+}
+
 export class Store {
   readonly root: string;
+  private readonly dataDir: string;
   private readonly tmpDir: string;
 
   constructor(dataDir: string) {
+    this.dataDir = dataDir;
     this.root = join(dataDir, 'blobs');
     this.tmpDir = join(dataDir, 'tmp');
     mkdirSync(this.root, { recursive: true });
@@ -30,7 +44,7 @@ export class Store {
   }
 
   path(sha256: string): string {
-    return join(this.root, sha256.slice(0, 2), sha256.slice(2, 4), sha256);
+    return blobPath(this.dataDir, sha256);
   }
 
   has(sha256: string): boolean {

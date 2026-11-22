@@ -187,7 +187,8 @@ export async function start(config: Config): Promise<Running> {
     res.setHeader('content-type', b.type);
     res.setHeader('accept-ranges', 'bytes');
     res.setHeader('etag', `"${sha}"`);
-    res.setHeader('cache-control', 'public, max-age=31536000, immutable');
+    // short and not immutable: after a take-down (CLI erase) an edge purge must stick
+    res.setHeader('cache-control', 'public, max-age=86400');
     // uploaded bytes are served as-is; never let them run as a page on this origin
     res.setHeader('x-content-type-options', 'nosniff');
     res.setHeader('content-security-policy', "default-src 'none'; sandbox");

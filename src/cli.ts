@@ -2,20 +2,24 @@
 //
 //   node src/cli.ts accounts
 //   node src/cli.ts add <npub|hex> <quota: 10G, 500M, unlimited>
-//   node src/cli.ts remove <npub|hex>
+//   node src/cli.ts remove <npub|hex> [--purge]
 //   node src/cli.ts bin
 //   node src/cli.ts restore <sha256> [<npub|hex> owner, default the box owner]
+//   node src/cli.ts erase <sha256>
 //
 // STORAGE_DIR is the data folder (default ./data). The server can keep running meanwhile.
 
 import { join } from 'node:path';
 import { Db } from './db.ts';
 import { npub, parsePubkey } from './keys.ts';
+import { removeBlobFile } from './store.ts';
 
 const dir = process.env.STORAGE_DIR || './data';
 const db = new Db(join(dir, 'storage.db'));
 const now = Math.floor(Date.now() / 1000);
-const [cmd, a, b] = process.argv.slice(2);
+const args = process.argv.slice(2);
+const flags = new Set(args.filter((x) => x.startsWith('--')));
+const [cmd, a, b] = args.filter((x) => !x.startsWith('--'));
 
 const size = (n: number) => {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -47,8 +51,23 @@ try {
       console.log(`added ${npub(pk(a))}`);
       break;
     case 'remove':
-      console.log(db.removeAccount(pk(a), now) ? 'removed; what only it held is in the bin' : 'no such account');
+      if (flags.has('--purge')) {
+        const erased = db.purgeAccount(pk(a), now);
+        if (erased === null) throw new Error('no such account');
+        for (const s of erased) removeBlobFile(dir, s);
+        console.log(`removed; erased ${erased.length} blobs only it held. Purge them from your edge cache too.`);
+      } else {
+        console.log(db.removeAccount(pk(a), now) ? 'removed; what only it held is in the bin' : 'no such account');
+      }
       break;
+    case 'erase': {
+      const s = (a ?? '').toLowerCase();
+      if (!/^[0-9a-f]{64}$/.test(s)) throw new Error('give a sha256');
+      if (!db.eraseNow(s)) throw new Error('that blob is not here');
+      removeBlobFile(dir, s);
+      console.log('erased. Purge it from your edge cache too (Cloudflare: Caching, Purge by URL).');
+      break;
+    }
     case 'bin':
       for (const x of db.binned()) console.log(`${x.sha256}  ${size(x.size)}  binned ${new Date(x.binned! * 1000).toISOString()}`);
       break;
@@ -62,7 +81,7 @@ try {
       break;
     }
     default:
-      console.log('commands: accounts | add <npub> <quota> | remove <npub> | bin | restore <sha256> [<npub>]');
+      console.log('commands: accounts | add <npub> <quota> | remove <npub> [--purge] | bin | restore <sha256> [<npub>] | erase <sha256>');
   }
 } catch (err) {
   console.error((err as Error).message);
