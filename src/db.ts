@@ -569,7 +569,7 @@ export class Db {
       if (!b || b.binned === null) return null;
       const by = this.binnedBy(sha256);
       const key = to.key ?? (by !== null && this.account(by) ? by : to.fallback);
-      if (!key) throw new Error('give the owner to restore it to');
+      if (!key) throw new Error('the account it is charged to is gone: give the owner to restore it to (or set STORAGE_OWNER)');
       this.ownIn(b.sha256, b.size, b.type, key, now);
       return key;
     });

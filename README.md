@@ -156,8 +156,8 @@ npm run accounts -- bin
 npm run accounts -- restore <sha256>
 ```
 
-`restore` gives the blob back to the account it is charged to, or to you when that account is gone. Name an npub
-after the hash to give it to someone else.
+`restore` gives the blob back to the account it is charged to, or to you (`STORAGE_OWNER`, set in the container)
+when that account is gone. Name an npub after the hash to give it to someone else.
 
 Removing a friend lets go of everything their keys held. What nobody else holds goes to the bin. A friend who
 is also a member of your home comes back at the next check; remove them on the home to keep them out.

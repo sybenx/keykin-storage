@@ -10,7 +10,7 @@ import { schnorr } from '@noble/curves/secp256k1.js';
 import type { Config } from '../src/config.ts';
 import { Db } from '../src/db.ts';
 import { serviceKey } from '../src/servicekey.ts';
-import { auth, box, DOMAIN, fakeHome, key, put, sha, tempDir, type Box, type FakeHome, type Key } from './helpers.ts';
+import { auth, box, cli, DOMAIN, fakeHome, key, put, sha, tempDir, type Box, type FakeHome, type Key } from './helpers.ts';
 
 const DAY = 86400;
 const URL_ = `https://${DOMAIN}/manage`;
@@ -538,5 +538,33 @@ describe('upgrading a 0.2.0 database', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('restore from the CLI', () => {
+  let b: Box;
+  before(async () => { b = await box(); });
+  after(() => b.close());
+
+  it('gives a blob back to the account it is charged to, else STORAGE_OWNER, and says so when neither is there', async () => {
+    const friend = key(), early = key(), gone = key();
+    // an unlimited friend added before anything else must not be taken for the box owner
+    b.run.db.sql.prepare('UPDATE accounts SET added = added + 10 WHERE pubkey = ?').run(b.owner.pk);
+    b.run.db.putAccount(early.pk, null, 0);
+    b.run.db.putAccount(friend.pk, 1e9, b.clock.now);
+    b.run.db.putAccount(gone.pk, 1e9, b.clock.now);
+    const x = randomBytes(5000), y = randomBytes(5000);
+    await put(b, friend, x);
+    await put(b, gone, y);
+    await del(b, friend, sha(x));
+    await del(b, gone, sha(y));
+    b.run.db.removeAccount(gone.pk, b.clock.now);
+    assert.match(cli(b.dir, 'restore', sha(x)), /restored to npub1/);
+    assert.notEqual(b.run.db.uploadedAt(sha(x), friend.pk), null);
+    assert.throws(() => cli(b.dir, { STORAGE_OWNER: '' }, 'restore', sha(y)), /account it is charged to is gone/);
+    assert.throws(() => cli(b.dir, { STORAGE_OWNER: 'nope' }, 'restore', sha(y)), /STORAGE_OWNER is not/);
+    cli(b.dir, { STORAGE_OWNER: b.owner.pk }, 'restore', sha(y));
+    assert.notEqual(b.run.db.uploadedAt(sha(y), b.owner.pk), null);
+    assert.equal(b.run.db.uploadedAt(sha(y), early.pk), null);
   });
 });
