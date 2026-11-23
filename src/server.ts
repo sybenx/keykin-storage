@@ -12,6 +12,7 @@ import { checkAuth, parseAuth, type Auth, type Verb } from './auth.ts';
 import type { Config } from './config.ts';
 import { Db, type Account, type Blob, type Pending, type Upload } from './db.ts';
 import { Home, httpHome, type HomeSource } from './home.ts';
+import { httpRpc, Keeper, wsUrlOf, type HomeRpc } from './keeper.ts';
 import { clientAddress, RateLimit } from './limit.ts';
 import { isManagePath, manager, send } from './manage.ts';
 import { guardedFetch, MirrorError } from './mirror.ts';
@@ -22,6 +23,7 @@ const SHA_PATH = /^\/([0-9a-fA-F]{64})(\.[A-Za-z0-9]{1,10})?$/;
 const UPLOADS_PATH = /^\/uploads\/([^/]+)(?:\/([^/]+))?$/;
 const UPLOAD_ID = /^[0-9a-f]{32}$/;
 const LIST_PATH = /^\/list\/([0-9a-fA-F]{64})$/;
+const GROUP_EVENTS_PATH = /^\/groups\/([0-9a-f]{32})\/events$/;
 const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}$/;
 const EXT: Record<string, string> = {
   'application/octet-stream': 'bin', 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp',
@@ -71,10 +73,12 @@ export interface Running {
   serviceKey: ServiceKey;
   /** Follows the home's member list, when STORAGE_HOME_URL is set and the box is set up. */
   home: Home | null;
+  /** Keeps the home's group keys and messages (keeper.ts), with the same conditions as `home`. */
+  keeper: Keeper | null;
   close(): Promise<void>;
 }
 
-export async function start(config: Config, opts: { homeSource?: HomeSource } = {}): Promise<Running> {
+export async function start(config: Config, opts: { homeSource?: HomeSource; homeRpc?: HomeRpc; noKeeperStart?: boolean } = {}): Promise<Running> {
   const now = config.now ?? (() => Math.floor(Date.now() / 1000));
   /** Largest body of one request (PUT /upload, /mirror); bigger files come in pieces. */
   const maxRequest = Math.min(config.maxRequestBytes ?? 256 * 1024 * 1024, config.maxBlobBytes);
@@ -95,6 +99,12 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
     })
     : null;
   if (home) db.saveHomeState({ url: config.homeUrl });
+  // The group keeper: this box holds every group key on the home (keeper.ts). Only with a home, like accounts.
+  const keeper = ready && config.homeUrl && (config.keeper !== false || opts.homeRpc)
+    ? new Keeper(db, opts.homeRpc ?? httpRpc(config.homeUrl, key, { timeoutMs: config.homeTimeoutMs ?? 10_000, now }), key, {
+      now, log, pollS: config.keeperPollS ?? 60, wsUrl: opts.homeRpc ? null : wsUrlOf(config.homeUrl), publicUrl: config.publicUrl,
+    })
+    : null;
 
   const pieceBytes = config.pieceBytes ?? 8 * 1024 * 1024;
   /** Largest file in pieces. */
@@ -260,6 +270,12 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
       if (part === undefined && method === 'DELETE') return abandon(req, res, id);
       if (part === 'complete' && method === 'POST') return complete(req, res, id);
       if (part !== undefined && method === 'PUT') return piece(req, res, id, part);
+    }
+    const groups = GROUP_EVENTS_PATH.exec(path);
+    if (groups && method === 'GET') {
+      if (!keeper) return fail(res, 404, 'this box keeps no groups');
+      const r = await keeper.door(req, groups[1]);
+      return send(res, r.status, r.body);
     }
     const list = LIST_PATH.exec(path);
     if (list && method === 'GET') return listBlobs(req, res, list[1].toLowerCase());
@@ -734,6 +750,7 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
 
   await new Promise<void>((resolve) => server.listen(config.port, config.host, resolve));
   home?.start();
+  if (!opts.noKeeperStart) keeper?.start();
   let closed: Promise<void> | null = null;
   const addr = server.address();
   const port = typeof addr === 'object' && addr ? addr.port : config.port;
@@ -746,10 +763,12 @@ export async function start(config: Config, opts: { homeSource?: HomeSource } = 
     sweepUploads,
     serviceKey: key,
     home,
+    keeper,
     close: async () => {
       // safe to call twice: the second call waits for the first
       closed ??= (async () => {
         await home?.stop();
+        await keeper?.stop();
         closing.abort();
         clearInterval(uploadTimer);
         await new Promise<void>((resolve) => {

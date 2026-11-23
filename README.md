@@ -276,6 +276,18 @@ are, and anything held. `home sync` asks the home now.
   unset `STORAGE_HOME_URL`, accounts that came from the home can't upload until you set it again; nothing is
   deleted.
 
+## Group keeper
+
+With a home set (`STORAGE_HOME_URL`), this box keeps every DMs group on that home (`src/keeper.ts`). The home names this storage's key as the groups' keeper, so every group key is sealed to it as well as to the people in the group; no group can keep the box out. With them the box:
+
+- seals the current key to someone who joined from a link, and the earlier keys to new members, so they read what was said before (the home lists what is owed: `keepergroups`);
+- makes the new key after someone leaves or the home removes them;
+- backs up every sealed message and tells the home (`groupkept`), which may then drop month-old ones.
+
+It never opens a message: it holds keys and sealed bytes. It looks every `STORAGE_KEEPER_POLL_S` seconds (60) and right away when the home's socket says a group changed. `STORAGE_KEEPER=off` turns it off.
+
+**The history door.** `GET /groups/<gid>/events?before=<seq>&limit=<n ≤ 200>`, with a NIP-98 (kind 27235) authorization for the exact url, method `GET` and the empty body's sha256. Someone in the group (checked against the home's roster, asked at most every 30 s) gets up to `limit` sealed events numbered below `before`, oldest first, as `[{seq, storedAt, event}]`. While the group lets new people see earlier messages (the default), that is everything; otherwise only from when they joined. Anyone else gets 403.
+
 ## Friends and the bin
 
 Until the admin page exists:

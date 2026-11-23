@@ -38,6 +38,10 @@ export interface Config {
   memberQuota: number;
   /** How often to fetch the member list, seconds. */
   homePollS: number;
+  /** The group keeper looks at every group this often, seconds, besides the home's wakes (keeper.ts). */
+  keeperPollS?: number;
+  /** Keep the home's group keys and messages (keeper.ts). On unless STORAGE_KEEPER=off. */
+  keeper?: boolean;
   /** Tests only: how long one member list fetch may take, ms (default 10 s). */
   homeTimeoutMs?: number;
   /** Where log lines go (default console.log). */
@@ -165,5 +169,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     homeUrl: homeUrl(env),
     memberQuota: memberQuota(env),
     homePollS: number(env, 'STORAGE_HOME_POLL_S', 300),
+    keeperPollS: number(env, 'STORAGE_KEEPER_POLL_S', 60),
+    keeper: (env.STORAGE_KEEPER ?? 'on').trim().toLowerCase() !== 'off',
   };
 }
