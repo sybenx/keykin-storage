@@ -6,7 +6,7 @@ file nobody owns any more waits 30 days in a bin first.
 
 See [DESIGN.md](DESIGN.md) for why it exists and where it's going (the keeper, key grants, the admin page).
 
-## What works now (0.4.0)
+## What works now (0.5.0)
 
 - **BUD-01** `GET/HEAD /<sha256>[.ext]`: Range requests, CORS, `nosniff` and a sandbox CSP on every blob. Images
   (not SVG), video and audio are served as their type; everything else, SVG included, as
