@@ -7,7 +7,10 @@ import { rmSync } from 'node:fs';
 import { after, describe, it } from 'node:test';
 import { schnorr } from '@noble/curves/secp256k1.js';
 import { eventId } from '../src/auth.ts';
-import { envelopePlain, parseEnvelope, type HomeRpc } from '../src/keeper.ts';
+import { envelopePlain, Keeper, parseEnvelope, type HomeRpc } from '../src/keeper.ts';
+import { Db } from '../src/db.ts';
+import http from 'node:http';
+import { join } from 'node:path';
 import { conversationKey, nip44Decrypt, nip44Encrypt } from '../src/nip44.ts';
 import { start, type Running } from '../src/server.ts';
 import { serviceKey } from '../src/servicekey.ts';
@@ -162,5 +165,93 @@ describe('the group keeper', () => {
     assert.deepEqual((await ok.json() as any[]).map((r) => r.seq), [1, 2]);
     assert.equal((await get(stranger)).status, 403);
     assert.equal((await get(ben, `https://${DOMAIN}/groups/other`)).status, 401);
+  });
+});
+
+/**
+ * A home's websocket, the way bothy answers the keeper: a REQ before AUTH gets an AUTH challenge and a CLOSED
+ * auth-required; an AUTH signed by `registered` for this relay url and challenge gets OK; the REQ asked again is held
+ * open, and the test pushes group events down it. Written with the RFC 6455 framing by hand (text frames only),
+ * since the box has no websocket dependency.
+ */
+async function fakeHomeSocket(registered: () => string) {
+  const server = http.createServer((_q, r) => r.writeHead(404).end());
+  const sockets: import('node:net').Socket[] = [];
+  const h = { url: '', reqs: [] as unknown[][], authed: [] as string[], refused: [] as string[], send: (_f: unknown[]) => {}, close: async () => {} };
+  server.on('upgrade', (req, socket) => {
+    sockets.push(socket as any);
+    const accept = createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    const challenge = randomBytes(8).toString('hex');
+    let authed = false;
+    const frame = (text: string) => {
+      const b = Buffer.from(text);
+      const head = b.length < 126 ? Buffer.from([0x81, b.length]) : Buffer.from([0x81, 126, b.length >> 8, b.length & 255]);
+      socket.write(Buffer.concat([head, b]));
+    };
+    h.send = (f) => frame(JSON.stringify(f));
+    let buf = Buffer.alloc(0);
+    socket.on('data', (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk]);
+      while (buf.length >= 2) {
+        let len = buf[1] & 127, off = 2;
+        if (len === 126) { len = buf.readUInt16BE(2); off = 4; }
+        if (buf.length < off + 4 + len) return;
+        const mask = buf.subarray(off, off + 4);
+        const data = Buffer.from(buf.subarray(off + 4, off + 4 + len).map((x, i) => x ^ mask[i % 4]));
+        const op = buf[0] & 15;
+        buf = buf.subarray(off + 4 + len);
+        if (op !== 1) continue;
+        const f = JSON.parse(data.toString());
+        if (f[0] === 'REQ') {
+          if (!authed) { frame(JSON.stringify(['AUTH', challenge])); frame(JSON.stringify(['CLOSED', f[1], 'auth-required: authentication required to read group events'])); }
+          else { h.reqs.push(f); frame(JSON.stringify(['EOSE', f[1]])); }
+        } else if (f[0] === 'AUTH') {
+          const e = f[1];
+          const tag = (n: string) => e.tags.find((t: string[]) => t[0] === n)?.[1];
+          const good = e.kind === 22242 && e.id === eventId(e) && e.pubkey === registered() && tag('challenge') === challenge && tag('relay') === h.url &&
+            schnorr.verify(Buffer.from(e.sig, 'hex'), Buffer.from(e.id, 'hex'), Buffer.from(e.pubkey, 'hex'));
+          if (good) { authed = true; h.authed.push(e.pubkey); } else h.refused.push('bad auth');
+          frame(JSON.stringify(['OK', e.id, good, good ? '' : 'invalid: bad auth']));
+        }
+      }
+    });
+    socket.on('error', () => {});
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  h.url = `ws://127.0.0.1:${(server.address() as { port: number }).port}`;
+  h.close = () => new Promise<void>((r) => { for (const s of sockets) s.destroy(); server.close(() => r()); });
+  return h;
+}
+
+describe("the keeper's socket to the home", () => {
+  it('authenticates with the service key, asks for group events, and looks at the groups when one arrives', async () => {
+    const dir = tempDir();
+    const sk = serviceKey(dir);
+    const db = new Db(join(dir, 'storage.db'));
+    const home = await fakeHomeSocket(() => sk.pk);
+    let looks = 0;
+    const rpc: HomeRpc = { async call(method) { if (method === 'keepergroups') looks++; return []; } };
+    const keeper = new Keeper(db, rpc, sk, { now: () => Math.floor(Date.now() / 1000), log: () => {}, pollS: 3600, wsUrl: home.url, publicUrl: `https://${DOMAIN}` });
+    const until = async (ok: () => boolean, what: string) => {
+      for (let i = 0; i < 200 && !ok(); i++) await new Promise((r) => setTimeout(r, 20));
+      assert.ok(ok(), what);
+    };
+    try {
+      keeper.start();
+      await until(() => looks >= 1, 'a first look at start');
+      await until(() => home.reqs.length === 1, 'the REQ again once authenticated');
+      assert.deepEqual(home.authed, [sk.pk]);
+      assert.deepEqual(home.refused, []);
+      assert.deepEqual(home.reqs[0].slice(2), [{ kinds: [1490, 1491] }]);
+      const before = looks;
+      home.send(['EVENT', 'keeper', { id: 'a'.repeat(64), kind: 1491, tags: [['h', 'ab'.repeat(16)]], content: '' }]);
+      await until(() => looks > before, 'a look within a second of the event');
+    } finally {
+      await keeper.stop();
+      await home.close();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
