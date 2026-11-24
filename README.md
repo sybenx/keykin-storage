@@ -1,12 +1,13 @@
 # Keykin Storage
 
 A Blossom server for your Keykin box. Your account and the friends you add can store files on it. Anyone can
-read a file by its hash (vault files are encrypted, so that's fine). Nothing is deleted behind your back: a
-file nobody owns any more waits 30 days in a bin first.
+read a file by its hash (vault files are encrypted, so that's fine). Place notes for DMs photos are kept apart and
+are not readable by hash. Nothing is deleted behind your back: a file nobody owns any more waits 30 days in a bin
+first.
 
 See [DESIGN.md](DESIGN.md) for why it exists and where it's going (the keeper, key grants, the admin page).
 
-## What works now (0.5.0)
+## What works now (0.6.0)
 
 - **BUD-01** `GET/HEAD /<sha256>[.ext]`: Range requests, CORS, `nosniff` and a sandbox CSP on every blob. Images
   (not SVG), video and audio are served as their type; everything else, SVG included, as
@@ -43,6 +44,9 @@ See [DESIGN.md](DESIGN.md) for why it exists and where it's going (the keeper, k
   what the url actually serves, if that's one of your `x` tags.
 - **Management** `POST /manage`: disk use, accounts, the bin, restore and erase, for a web page signed in as the
   box owner or one of the home's admins. See below.
+- **Photo places** `POST /places` (0.6.0): for DMs, says which people are on this box, keeps the small place notes
+  that say where a photo was taken for them, and names the nearest town to a point from a list built into the
+  image. Only the box owner, the home's owner and its members may call it. See below.
 
 Not here: BUD-05 media, BUD-07 payments, BUD-08, BUD-09 reports.
 
@@ -75,6 +79,7 @@ STORAGE_PUBLIC_URL=https://storage.example.com STORAGE_OWNER=npub1… npm start
 | `STORAGE_HOME_URL` | (none) | Your home's https address. When set, its members may upload here |
 | `STORAGE_MEMBER_QUOTA` | `5G` | Quota of each member of the home |
 | `STORAGE_HOME_POLL_S` | `300` | How often to ask the home for its member list |
+| `STORAGE_TOWNS` | `/app/towns/towns.tsv.gz` | The town list `names` answers from (built into the image), or `off` |
 
 Upgrading from 0.3.0: `STORAGE_MAX_BLOB_MB` used to be the cap on one request too. If you raised it to take bigger
 single uploads, also set `STORAGE_MAX_REQUEST_MB`, or those uploads stop at 256 MiB.
@@ -284,9 +289,108 @@ With a home set (`STORAGE_HOME_URL`), this box keeps every DMs group on that hom
 - makes the new key after someone leaves or the home removes them;
 - backs up every sealed message and tells the home (`groupkept`), which may then drop month-old ones.
 
-It never opens a message: it holds keys and sealed bytes. It looks every `STORAGE_KEEPER_POLL_S` seconds (60) and right away when the home's socket says a group changed. `STORAGE_KEEPER=off` turns it off.
+It never opens a message: it holds keys and sealed bytes. Those keys would open the group's messages, and with them the place notes of photos sent in groups (see Photo places); the box does not do either. It looks every `STORAGE_KEEPER_POLL_S` seconds (60) and right away when the home's socket says a group changed. `STORAGE_KEEPER=off` turns it off.
 
 **The history door.** `GET /groups/<gid>/events?before=<seq>&limit=<n ≤ 200>`, with a NIP-98 (kind 27235) authorization for the exact url, method `GET` and the empty body's sha256. Someone in the group (checked against the home's roster, asked at most every 30 s) gets up to `limit` sealed events numbered below `before`, oldest first, as `[{seq, storedAt, event}]`. While the group lets new people see earlier messages (the default), that is everything; otherwise only from when they joined. Anyone else gets 403.
+
+## Photo places (`POST /places`)
+
+Place notes are not readable by hash: `GET /<sha256>` answers 404 for them, `/list` and `/manage usage` leave them
+out, and the keeper never touches them.
+
+DMs (0.5.0 and later) uses this to show where a photo was taken to the people in a chat who are on this box. The
+photo itself always goes up with its location stripped. When someone in the chat is on the box, the
+sender's phone also seals a small **place note** (where it was taken, and the bytes stripping removed, so the
+original can be put back bit for bit) and stores it here. The key that opens a note travels inside the message, not
+here. Someone on the box can fetch a note by its sha (named in the message) and open it with that key; someone who
+is not on the box can't fetch it. The same endpoint names the nearest town to a photo's place; the box looks it up
+itself, in a list built into the image, and asks no other service.
+
+**Who is on the box:** `STORAGE_OWNER`, the home's owner, and the members on the home's member list (refreshed every
+5 minutes, and once when an unknown key signs, at most once a minute). Friends added by hand who are not members of
+the home are not. With `STORAGE_HOME_URL` unset, only `STORAGE_OWNER`.
+
+### Request
+
+The same shape as `/manage`:
+
+```
+POST <STORAGE_PUBLIC_URL>/places
+Content-Type: application/nostr+json+rpc
+Authorization: Nostr <base64 of a signed kind 27235 event>
+
+{"method":"members","params":[["<hex pubkey>", ...]]}
+```
+
+The event's tags: `u` is `STORAGE_PUBLIC_URL` followed by `/places` (`https://x//places` works too, `https://x/places/`
+does not), `method` is `POST`, `payload` is the hex sha256 of the exact body bytes. `created_at` must be within 60
+seconds of the box's clock, either way. The body is at most 256 KiB.
+
+### Replies
+
+HTTP 200 with `{"result": …}`, or HTTP 200 with `{"error": "…"}` for a call that can't be done (unknown method, bad
+params). Every other status also has a JSON body `{"error": "…"}`, and every reply has `cache-control: no-store`.
+Checked in this order:
+
+| Status | When |
+|---|---|
+| 429 | too many signed requests from your address (the same limit as uploads) |
+| 405 | not POST |
+| 415 | the content type isn't `application/nostr+json+rpc` |
+| 413 | the body is over 256 KiB |
+| 400 | the body isn't `{"method": "...", "params": [...]}` |
+| 503 | the box isn't set up yet |
+| 401 | no or bad `Authorization` (the reason says what is wrong), or a good signature from a key not on the box: always `this key is not on this box`, whatever the method |
+| 200 | the method's answer, or `{"error": "unknown method"}` |
+
+### Methods
+
+| Method | Params | Result | Errors (HTTP 200 with `error`, unless a status is given) |
+|---|---|---|---|
+| `members` | `[["<hex>", ...]]`: 1 to 500 keys, lowercase 64-character hex | `{"<hex>": true or false, ...}` for each key asked | `members takes an array of 1 to 500 pubkeys, as 64-character hex` |
+| `put` | `["<base64 sealed note>"]`: 1 to 65,536 bytes once decoded | `{"sha": "<sha256 hex of the decoded bytes>"}` | `put takes one sealed place note, at most 65536 bytes, as base64`; `too many place notes stored for you` (over 100,000 for your account); HTTP 507 `this box is out of disk space` |
+| `get` | `[["<sha256>", ...]]`: 1 to 100 | `{"<sha256>": "<base64>", ...}` with only the notes this box has | `get takes an array of 1 to 100 sha256 hashes` |
+| `drop` | `[["<sha256>", ...]]`: 1 to 100 | `{"dropped": n}`: only notes your account stored | `drop takes an array of 1 to 100 sha256 hashes` |
+| `names` | `[{"points": [[lat, lon], ...]}]`: 1 to 200 points, numbers, lat -90 to 90, lon -180 to 180 | `{"list": "<town list version>", "names": [{"town", "region", "country", "cc", "km"} or null, ...]}` in the order asked | `names takes {"points": [[lat, lon], ...]}, 1 to 200 points`; `this box has no town list`; `the town list is still loading`; HTTP 429 `too many town lookups; wait a minute` |
+
+- `put`: the note belongs to your account (the box owner's account when you are the home's owner with none of your
+  own). Base64 is the standard alphabet, padding optional. Storing a note that is already here answers the same sha
+  and changes nothing.
+- `get`: anyone on the box gets every note asked for that is here. Shas may be either case; the result's keys are
+  lowercase. A note that is not here is left out.
+- `drop`: notes someone else stored are not dropped (and not counted).
+- Notes go with their account: when the home removes a member, or someone erases their own account, their notes are
+  deleted with the account. A friend removed from the command line loses theirs too. A member who was also added by
+  hand keeps the account, and the notes, but is no longer on the box.
+- `names`: every point is rounded to 2 decimals (about 1 km) before it is looked up. Each answer is the nearest town
+  within 30 km of the rounded point, or null. When two towns are within 1 km of the same distance, the bigger one
+  (by population) wins. `region` is the state, province or similar, `""` when the list has none; `cc` is the ISO
+  3166 country code; `km` is the distance from the rounded point, to 0.1. 30 calls a minute per key, past that 429.
+  The list loads in the first second or so after a start; until then `names` says it is still loading.
+- One log line per call with the method and counts. Never coordinates, keys or note bytes.
+
+### The town list
+
+Town names come from GeoNames `cities500` (places with at least 500 people), with region names from
+`admin1CodesASCII.txt` and country names from `countryInfo.txt`. Only populated places are kept (feature codes PPL,
+PPLA to PPLA5, PPLC, PPLG, PPLS, PPLF, PPLL and PPLR; sections of towns, historical, abandoned and destroyed places
+are dropped), about 226,000 towns. The image build downloads the three files once, runs `scripts/towns.ts` and
+writes `/app/towns/towns.tsv.gz` (about 4 MB) and `/app/towns/SOURCE` (download date, the sha256 of every input and
+of the list, the licence line). Loaded, the list keeps about 8 MB (a running box uses about 24 MiB more than 0.5.0),
+and a lookup takes a few microseconds (a grid of 1° cells). The box makes no network call for towns. Updating the list means building the image again.
+
+Town names: GeoNames (geonames.org), CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). The list here is
+changed from the original: only populated places, reduced to name, position, region, country and population.
+
+To pin the inputs of a build, pass their sha256 sums (from an earlier `SOURCE`): `docker build --build-arg
+CITIES_SHA256=… --build-arg ADMIN1_SHA256=… --build-arg COUNTRIES_SHA256=…`. A build whose download does not match
+stops. `GEONAMES_URL` points the build at another copy of the same files.
+
+`STORAGE_TOWNS` names another list file (the same format), or `off` to answer every `names` call with `this box has no
+town list`. A file that is missing or can't be read gives the same answer, with one log line at start.
+
+Running it on your own machine for app tests, with a member list from a file and the small test list: see
+[docs/local-run.md](docs/local-run.md).
 
 ## Friends and the bin
 

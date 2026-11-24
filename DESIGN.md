@@ -1,4 +1,4 @@
-# Keykin Storage: design (draft, 2026-11-20, updated for 0.2.0 on 2026-11-21, 0.3.0 and 0.4.0 on 2026-11-22)
+# Keykin Storage: design (draft, 2026-11-20, updated for 0.2.0 on 2026-11-21, 0.3.0 and 0.4.0 on 2026-11-22, 0.6.0 on 2026-11-24)
 
 Working name. A small Blossom server and keeper that runs on your Keykin box, so your files have a home
 you own. It is the storage half of Marble as a Google Drive replacement. It is built for vaults
@@ -8,7 +8,8 @@ you own. It is the storage half of Marble as a Google Drive replacement. It is b
 
 - **Your files outlive any one server.** A full copy of everything your account stores sits on a disk you own.
 - **Friends back each other up.** You give a friend a quota on your box, and they give you one on theirs.
-  Everything stored is ciphertext, so the host learns sizes and times, nothing else.
+  Files people send are sealed on their phones and stored as they come. The box holds the home's group keys and
+  answers town lookups for members, so those it can read.
 - **No port to open.** Most boxes have no public address (Keykin DIRECTION.md, 2026-11-20). The keeper
   works with outbound connections only. Serving is a bonus for boxes that have a door.
 
@@ -159,6 +160,7 @@ grants.
 6. Done in 0.2.0: the review fixes (§9) and accounts that follow the home's member list (§8).
 7. Done in 0.3.0: the management surface a web page builds on (§10).
 8. Done in 0.4.0: uploads in pieces, for full-quality photos and video from phones (§11).
+9. Done in 0.6.0: photo places for DMs (§12).
 
 ## 8. Accounts that follow the home's member list (0.2.0)
 
@@ -259,3 +261,26 @@ restarted the whole file. The full contract is in the README.
   A second `complete` during the first waits for the same answer. After a lost answer the phone asks
   `POST /uploads` again: the descriptor says it is stored.
 - **Limits.** 8 MiB pieces (setting), at most 4,096 pieces, at most 2 open uploads per account and 32 on the box.
+
+## 12. Photo places (0.6.0)
+
+DMs strips the location from every photo and video it sends, and shows where one was taken only to the people in the
+chat who are on this box. The full contract (DMs `LOCATION-CONTRACT.md`, section 3) is in the README, "Photo places".
+
+- **One small endpoint.** `POST /places`, the `/manage` shape and signature, for keys on the box: `STORAGE_OWNER`, the
+  home's owner, and the home's members (`Db.onBox`, from the same member list uploads use). After a good signature,
+  every refusal is the same 401 `this key is not on this box`.
+- **Place notes, not stripped copies.** The sender's phone uploads the stripped file as before, plus a sealed note
+  (under 64 KiB: where it was taken, and the original bytes stripping changed) that only this box keeps. The note's
+  key rides in the message. The box keeps notes in their own table, apart from blobs: never served by hash, listed,
+  counted in usage, mirrored or swept, and gone with their account. Any key on the box may `get` any note by sha.
+- **What the box can read.** Notes of one-to-one messages: only who stored them, when, and their size. Notes of
+  group messages: the box holds every group key as keeper (README, Group keeper), so it could open those messages and
+  their notes; it does not. Town lookups arrive as plain JSON, rounded to 2 decimals: the box, and a tunnel in front of it, see those
+  points.
+- **Towns without asking anyone.** GeoNames cities500 (CC BY 4.0), filtered to populated places by
+  `scripts/towns.ts` when the image is built, with a `SOURCE` file of checksums and the licence line. At start the box
+  reads it (gunzip stream, after it listens) into typed arrays, names as one UTF-8 array, and a grid of 1° cells: about
+  8 MB kept (the container uses about 24 MiB more than 0.5.0 after start), a few microseconds a lookup. The nearest town within 30 km wins, the bigger one when two are within 1 km of the same distance.
+- **Limits.** 100,000 notes per account, 500 keys per `members`, 100 shas per `get` or `drop`, 200 points per
+  `names`, 30 `names` calls a minute per key. Log lines carry counts only.
