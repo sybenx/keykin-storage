@@ -1,5 +1,5 @@
 // The Blossom server: BUD-01 (get), 02 (upload), 04 (mirror), 06 (upload preflight), 11 (auth), 12 (list, delete).
-// And the management surface, POST /manage (manage.ts).
+// And the management surface, POST /manage (manage.ts), and photo places for DMs, POST /places (places.ts).
 // Writes come only from keys of accounts on this box. Reads are open. Nothing is deleted on a timer except blobs
 // that sat in the bin (owned by nobody) for binDays.
 
@@ -16,8 +16,10 @@ import { httpRpc, Keeper, wsUrlOf, type HomeRpc } from './keeper.ts';
 import { clientAddress, RateLimit } from './limit.ts';
 import { isManagePath, manager, send } from './manage.ts';
 import { guardedFetch, MirrorError } from './mirror.ts';
+import { isPlacesPath, placesHandler } from './places.ts';
 import { serviceKey, type ServiceKey } from './servicekey.ts';
 import { Aborted, Store, TooLarge, TooSlow, type MinRate, type Received } from './store.ts';
+import { Towns } from './towns.ts';
 
 const SHA_PATH = /^\/([0-9a-fA-F]{64})(\.[A-Za-z0-9]{1,10})?$/;
 const UPLOADS_PATH = /^\/uploads\/([^/]+)(?:\/([^/]+))?$/;
@@ -75,10 +77,16 @@ export interface Running {
   home: Home | null;
   /** Keeps the home's group keys and messages (keeper.ts), with the same conditions as `home`. */
   keeper: Keeper | null;
+  /** The town list behind `names` (towns.ts), or null when STORAGE_TOWNS is off. It loads after the server listens. */
+  towns: Towns | null;
   close(): Promise<void>;
 }
 
-export async function start(config: Config, opts: { homeSource?: HomeSource; homeRpc?: HomeRpc; noKeeperStart?: boolean } = {}): Promise<Running> {
+export async function start(config: Config, opts: {
+  homeSource?: HomeSource; homeRpc?: HomeRpc; noKeeperStart?: boolean;
+  /** Tests only: this town list instead of the one STORAGE_TOWNS names; it is not loaded here. */
+  towns?: Towns | null;
+} = {}): Promise<Running> {
   const now = config.now ?? (() => Math.floor(Date.now() / 1000));
   /** Largest body of one request (PUT /upload, /mirror); bigger files come in pieces. */
   const maxRequest = Math.min(config.maxRequestBytes ?? 256 * 1024 * 1024, config.maxBlobBytes);
@@ -232,6 +240,17 @@ export async function start(config: Config, opts: { homeSource?: HomeSource; hom
 
   const limit = new RateLimit({ burst: config.authBurst ?? 60, perSecond: config.authPerSecond ?? 10 });
   const manage = manager({ config, db, home, key, ready, now, removeFile: (s) => store.remove(s) });
+  const townsFile = config.towns ?? 'off';
+  const towns = opts.towns !== undefined ? opts.towns : townsFile === 'off' ? null : new Towns(townsFile, log);
+  const room = (n: number) => {
+    try {
+      diskRoom(n);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const places = placesHandler({ config, db, home, key, ready, now, towns, room, log });
 
   const timer = setInterval(sweep, 3600_000);
   timer.unref();
@@ -251,10 +270,11 @@ export async function start(config: Config, opts: { homeSource?: HomeSource; hom
     if (method === 'OPTIONS') return end(res, 204);
     if (req.headers.authorization !== undefined && !limit.take(clientAddress(req, config.behindCloudflare))) {
       const why = 'too many signed requests from your address; wait a few seconds';
-      if (isManagePath(path)) return send(res, 429, { error: why }, method === 'HEAD');
+      if (isManagePath(path) || isPlacesPath(path)) return send(res, 429, { error: why }, method === 'HEAD');
       return fail(res, 429, why, method === 'HEAD');
     }
     if (isManagePath(path)) return manage.handle(req, res, path); // answers `info` even before the box is set up
+    if (isPlacesPath(path)) return places.handle(req, res); // answers 503 itself before the box is set up
     if (!ready && method !== 'GET' && method !== 'HEAD') {
       return fail(res, 503, 'this box is not set up yet: set STORAGE_PUBLIC_URL and STORAGE_OWNER');
     }
@@ -751,6 +771,7 @@ export async function start(config: Config, opts: { homeSource?: HomeSource; hom
   await new Promise<void>((resolve) => server.listen(config.port, config.host, resolve));
   home?.start();
   if (!opts.noKeeperStart) keeper?.start();
+  if (opts.towns === undefined) void towns?.load(); // after listening: `names` says "still loading" until it is in
   let closed: Promise<void> | null = null;
   const addr = server.address();
   const port = typeof addr === 'object' && addr ? addr.port : config.port;
@@ -764,6 +785,7 @@ export async function start(config: Config, opts: { homeSource?: HomeSource; hom
     serviceKey: key,
     home,
     keeper,
+    towns,
     close: async () => {
       // safe to call twice: the second call waits for the first
       closed ??= (async () => {

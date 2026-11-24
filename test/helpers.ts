@@ -58,14 +58,14 @@ export interface Box {
 }
 
 /** A server on a free loopback port, in a temp folder, with a settable clock. Close it in after(). */
-export async function box(over: Partial<Config> = {}, opts: { dir?: string; owner?: Key } = {}): Promise<Box> {
+export async function box(over: Partial<Config> = {}, opts: { dir?: string; owner?: Key; start?: Parameters<typeof start>[1] } = {}): Promise<Box> {
   const dir = opts.dir ?? tempDir();
   const owner = opts.owner ?? key();
   const clock = { now: Math.floor(Date.now() / 1000) };
   const run = await start({
     dataDir: dir, host: '127.0.0.1', port: 0, publicUrl: `https://${DOMAIN}`, domains: [DOMAIN], owner: owner.pk,
     maxBlobBytes: 1024 * 1024, maxBlobsPerAccount: 200_000, binDays: 30, mirrorTimeoutMs: 5000, diskMarginBytes: 0, behindCloudflare: false, homeUrl: '', memberQuota: 5e9, homePollS: 300, now: () => clock.now, keeper: false, ...over,
-  });
+  }, opts.start);
   return {
     run, url: run.url, owner, clock, dir,
     close: async () => {

@@ -176,6 +176,13 @@ const MIGRATIONS: ((db: Db) => void)[] = [
     CREATE TABLE IF NOT EXISTS upload_pieces (
       upload TEXT NOT NULL REFERENCES uploads(id) ON DELETE CASCADE, idx INTEGER NOT NULL, bytes INTEGER NOT NULL,
       PRIMARY KEY (upload, idx));`),
+  // 0.6.0: place notes (places.ts). Small sealed files kept apart from blobs: never served by hash, listed or counted
+  // in usage. They go with their account.
+  (db) => db.sql.exec(`
+    CREATE TABLE IF NOT EXISTS place_notes (
+      sha TEXT PRIMARY KEY, account TEXT NOT NULL REFERENCES accounts(pubkey) ON DELETE CASCADE,
+      bytes BLOB NOT NULL, created INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS place_notes_account ON place_notes(account, created);`),
 ];
 
 export interface Owned extends Blob {
@@ -658,6 +665,54 @@ export class Db {
   /** Ids of uploads no longer open (touched at or before `since`). */
   expiredUploads(since: number): string[] {
     return this.sql.prepare('SELECT id FROM uploads WHERE touched <= ?').all(since).map((r) => r.id as string);
+  }
+
+  // --- place notes (places.ts)
+
+  /**
+   * Whether a key is on this box: the box owner, the home's owner (from the last good member list), or a key of an
+   * account the home's member list has. Friends added by hand who are not members are not.
+   */
+  onBox(pubkey: string, boxOwner: string): boolean {
+    if (pubkey === boxOwner) return true;
+    if (pubkey === this.homeRoles().owner) return true;
+    return this.accountOf(pubkey)?.member === 1;
+  }
+
+  /** Keeps a note for `account`. A sha already here is left as it is. Returns whether it is new. */
+  putNote(sha: string, account: string, bytes: Uint8Array, now: number): boolean {
+    return this.sql.prepare('INSERT OR IGNORE INTO place_notes (sha, account, bytes, created) VALUES (?, ?, ?, ?)')
+      .run(sha, account, bytes, now).changes > 0;
+  }
+
+  /** Whether a note with this sha is here. */
+  hasNote(sha: string): boolean {
+    return !!this.sql.prepare('SELECT 1 FROM place_notes WHERE sha = ?').get(sha);
+  }
+
+  /** The notes here among `shas`, by sha. */
+  getNotes(shas: string[]): Map<string, Uint8Array> {
+    const out = new Map<string, Uint8Array>();
+    const q = this.sql.prepare('SELECT bytes FROM place_notes WHERE sha = ?');
+    for (const s of shas) {
+      const r = q.get(s);
+      if (r) out.set(s, r.bytes as Uint8Array);
+    }
+    return out;
+  }
+
+  /** Drops the notes among `shas` that `account` stored. Returns how many went. */
+  dropNotes(account: string, shas: string[]): number {
+    return this.tx(() => {
+      const q = this.sql.prepare('DELETE FROM place_notes WHERE sha = ? AND account = ?');
+      let n = 0;
+      for (const s of shas) n += Number(q.run(s, account).changes);
+      return n;
+    });
+  }
+
+  noteCount(account: string): number {
+    return Number(this.sql.prepare('SELECT COUNT(*) AS n FROM place_notes WHERE account = ?').get(account)!.n);
   }
 
   // --- the bin

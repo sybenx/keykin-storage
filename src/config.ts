@@ -63,7 +63,17 @@ export interface Config {
   mirrorAllowPrivate?: boolean;
   /** Tests only: the clock, in Unix seconds. */
   now?: () => number;
+  /**
+   * The town list `names` answers from (places.ts, towns.ts): a gzipped TSV built by scripts/towns.ts, or 'off'.
+   * Unset (tests) is 'off'.
+   */
+  towns?: string;
+  /** Tests only: most place notes one account may keep (default 100,000). */
+  maxPlaceNotes?: number;
 }
+
+/** Where the image keeps its town list. */
+export const DEFAULT_TOWNS = '/app/towns/towns.tsv.gz';
 
 const MiB = 1024 * 1024;
 /** Largest blob by default: 16 GiB, room for long phone video. */
@@ -135,6 +145,13 @@ function flag(env: NodeJS.ProcessEnv, name: string): boolean {
   throw new Error(`${name} must be true or false`);
 }
 
+/** STORAGE_TOWNS: a path to the town list, or off. Unset gives the image's list. */
+function towns(env: NodeJS.ProcessEnv): string {
+  const raw = (env.STORAGE_TOWNS ?? '').trim();
+  if (!raw) return DEFAULT_TOWNS;
+  return raw.toLowerCase() === 'off' ? 'off' : raw;
+}
+
 /**
  * Reads the settings. A box installed before it's set up (no STORAGE_PUBLIC_URL or STORAGE_OWNER) still starts:
  * it serves reads and refuses every write with 503 until both are set. Malformed values are errors that name
@@ -171,5 +188,6 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     homePollS: number(env, 'STORAGE_HOME_POLL_S', 300),
     keeperPollS: number(env, 'STORAGE_KEEPER_POLL_S', 60),
     keeper: (env.STORAGE_KEEPER ?? 'on').trim().toLowerCase() !== 'off',
+    towns: towns(env),
   };
 }

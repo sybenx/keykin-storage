@@ -51,7 +51,8 @@ export interface ManageOptions {
   removeFile: (sha256: string) => void;
 }
 
-class Refusal extends Error {
+/** A refusal with its HTTP status; the reason goes back as `{"error": reason}`. */
+export class Refusal extends Error {
   readonly status: number;
   constructor(status: number, reason: string) {
     super(reason);
@@ -97,7 +98,7 @@ export function manager(o: ManageOptions) {
       if (method !== 'POST') throw new Refusal(405, 'use POST');
       const type = (req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
       if (type !== CONTENT_TYPE) throw new Refusal(415, `content type must be ${CONTENT_TYPE}`);
-      const body = await readBody(req);
+      const body = await readBody(req, MAX_BODY);
       let call: { method: string; params: unknown[] };
       try {
         const j = JSON.parse(body.toString('utf8'));
@@ -219,12 +220,13 @@ function hashes(params: unknown[]): string[] | string {
 }
 
 /**
- * Reads a body of at most MAX_BODY bytes. A larger one is read to its end and refused (so the client gets the
- * answer, not a reset), unless it is past HARD_MAX, which is not read at all.
+ * Reads a body of at most `max` bytes. A larger one is read to its end and refused (so the client gets the answer,
+ * not a reset), unless it is past HARD_MAX, which is not read at all.
  */
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
+export function readBody(req: http.IncomingMessage, max: number): Promise<Buffer> {
+  const tooBig = () => new Refusal(413, `body is over ${max / 1024} KiB`);
   const declared = req.headers['content-length'];
-  if (declared && /^\d+$/.test(declared) && Number(declared) > HARD_MAX) return Promise.reject(new Refusal(413, `body is over ${MAX_BODY / 1024} KiB`));
+  if (declared && /^\d+$/.test(declared) && Number(declared) > HARD_MAX) return Promise.reject(tooBig());
   return new Promise((resolve, reject) => {
     const parts: Buffer[] = [];
     let n = 0;
@@ -237,13 +239,13 @@ function readBody(req: http.IncomingMessage): Promise<Buffer> {
       if (n > HARD_MAX) {
         clearTimeout(timer);
         req.destroy();
-        return reject(new Refusal(413, `body is over ${MAX_BODY / 1024} KiB`));
+        return reject(tooBig());
       }
-      if (n <= MAX_BODY) parts.push(c);
+      if (n <= max) parts.push(c);
     });
     req.on('end', () => {
       clearTimeout(timer);
-      if (n > MAX_BODY) reject(new Refusal(413, `body is over ${MAX_BODY / 1024} KiB`));
+      if (n > max) reject(tooBig());
       else resolve(Buffer.concat(parts));
     });
     req.on('error', (err) => {
