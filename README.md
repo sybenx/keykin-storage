@@ -1,8 +1,8 @@
 # Keykin Storage
 
-A Blossom server for your Keykin box. Your account and the friends you add can store files on it. Anyone can
-read a file by its hash (vault files are encrypted, so that's fine). Nothing is deleted behind your back: a
-file nobody owns any more waits 30 days in a bin first.
+A Blossom server for a Keykin box. The box owner's account and the accounts the owner adds can store files on
+it. Any file can be read by its hash; vault files are encrypted before upload. A file that no account holds any
+more stays in a bin for 30 days before it is erased.
 
 See [DESIGN.md](DESIGN.md) for why it exists and where it's going (the keeper, key grants, the admin page).
 
