@@ -82,6 +82,7 @@ export async function build(inDir: string, outDir: string, downloaded: string): 
   }
   // about 10 MB of text before gzip: fine at build time, and gzipSync keeps the bytes the same run to run
   const gz = gzipSync(Buffer.from(rows.join('\n') + '\n', 'utf8'), { level: 9 });
+  gz[9] = 3; // the header's OS byte says Unix wherever it is built, so a Mac and the image make the same bytes
   writeFileSync(join(outDir, 'towns.tsv.gz'), gz);
   const outSha = sha256(gz);
   const zip = join(inDir, 'cities500.zip');

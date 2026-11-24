@@ -15,6 +15,7 @@ export const TIE_KM = 1;
 const R = 6371.0088;
 const KM_PER_DEG = (Math.PI / 180) * R;
 const RAD = Math.PI / 180;
+const NAMES = new TextDecoder();
 
 export interface Town {
   town: string;
@@ -48,7 +49,9 @@ export class Towns {
   private lat = new Float32Array(0);
   private lon = new Float32Array(0);
   private pop = new Uint32Array(0);
-  private names: string[] = [];
+  /** Every name as UTF-8, one after another; town i's is nameBytes[nameEnd[i - 1] .. nameEnd[i]). */
+  private nameBytes = new Uint8Array(0);
+  private nameEnd = new Uint32Array(0);
   /** Per town: an index into `places` (region) and into `lands` (cc and country). */
   private region = new Uint16Array(0);
   private land = new Uint16Array(0);
@@ -77,8 +80,12 @@ export class Towns {
   private async read(): Promise<void> {
     let cap = 1 << 16, n = 0;
     let lat = new Float32Array(cap), lon = new Float32Array(cap), pop = new Uint32Array(cap);
-    let region = new Uint16Array(cap), land = new Uint16Array(cap);
-    const names: string[] = [];
+    let region = new Uint16Array(cap), land = new Uint16Array(cap), nameEnd = new Uint32Array(cap);
+    // names go straight into one byte array: a substring of a line would keep the whole line alive in V8
+    let nameBytes = new Uint8Array(4 << 20), at = 0;
+    const utf8 = new TextEncoder();
+    /** A copy of a substring that holds nothing else alive. */
+    const own = (s: string) => Buffer.from(s, 'utf8').toString('utf8');
     const placeIx = new Map<string, number>(), landIx = new Map<string, number>();
     const places: string[] = [], lands: { cc: string; country: string }[] = [];
     const grow = <T extends Float32Array | Uint32Array | Uint16Array>(a: T): T => {
@@ -106,23 +113,29 @@ export class Towns {
       if (!f[0] || !Number.isFinite(la) || !Number.isFinite(lo) || la < -90 || la > 90 || lo < -180 || lo > 180) continue;
       if (n === cap) {
         cap *= 2;
-        lat = grow(lat); lon = grow(lon); pop = grow(pop); region = grow(region); land = grow(land);
+        lat = grow(lat); lon = grow(lon); pop = grow(pop); region = grow(region); land = grow(land); nameEnd = grow(nameEnd);
       }
+      if (at + f[0].length * 3 > nameBytes.length) {
+        const b = new Uint8Array(nameBytes.length * 2);
+        b.set(nameBytes);
+        nameBytes = b;
+      }
+      at += utf8.encodeInto(f[0], nameBytes.subarray(at)).written;
+      nameEnd[n] = at;
       lat[n] = la;
       lon[n] = lo;
       pop[n] = Math.min(Number(f[6]) || 0, 0xffffffff);
-      names.push(f[0]);
       // regions and countries repeat: one string each, kept once
       const lk = `${f[3]}\t${f[5]}`;
       let li = landIx.get(lk);
       if (li === undefined) {
-        li = lands.push({ cc: f[3], country: f[5] }) - 1;
+        li = lands.push({ cc: own(f[3]), country: own(f[5]) }) - 1;
         landIx.set(lk, li);
       }
       let pi = placeIx.get(f[4]);
       if (pi === undefined) {
-        pi = places.push(f[4]) - 1;
-        placeIx.set(f[4], pi);
+        pi = places.push(own(f[4])) - 1;
+        placeIx.set(places[pi], pi);
       }
       if (li > 0xffff || pi > 0xffff) throw new Error('more than 65,536 regions or countries');
       land[n] = li;
@@ -144,7 +157,8 @@ export class Towns {
 
     this.lat = lat.slice(0, n); this.lon = lon.slice(0, n); this.pop = pop.slice(0, n);
     this.region = region.slice(0, n); this.land = land.slice(0, n);
-    this.names = names; this.places = places; this.lands = lands;
+    this.nameBytes = nameBytes.slice(0, at); this.nameEnd = nameEnd.slice(0, n);
+    this.places = places; this.lands = lands;
     this.cellStart = start; this.cellItems = items;
     this.count = n;
     this.version = sourceVersion(this.file) ?? `sha256-${hash.digest('hex').slice(0, 16)}`;
@@ -192,7 +206,8 @@ export class Towns {
       }
     }
     const l = this.lands[this.land[pick]];
-    return { town: this.names[pick], region: this.places[this.region[pick]], country: l.country, cc: l.cc, km: Math.round(pickD * 10) / 10 };
+    const name = NAMES.decode(this.nameBytes.subarray(pick === 0 ? 0 : this.nameEnd[pick - 1], this.nameEnd[pick]));
+    return { town: name, region: this.places[this.region[pick]], country: l.country, cc: l.cc, km: Math.round(pickD * 10) / 10 };
   }
 }
 
