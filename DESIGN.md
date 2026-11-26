@@ -1,4 +1,4 @@
-# Keykin Storage: design (draft, 2026-11-20, updated for 0.2.0 on 2026-11-21, 0.3.0 and 0.4.0 on 2026-11-22, 0.6.0 on 2026-11-24)
+# Keykin Storage: design (draft, 2026-11-20, updated for 0.2.0 on 2026-11-21, 0.3.0 and 0.4.0 on 2026-11-22, 0.6.0 on 2026-11-24, 0.7.0 on 2026-11-26)
 
 Working name. A small Blossom server and keeper that runs on your Keykin box, so your files have a home
 you own. It is the storage half of Marble as a Google Drive replacement. It is built for vaults
@@ -161,6 +161,7 @@ grants.
 7. Done in 0.3.0: the management surface a web page builds on (§10).
 8. Done in 0.4.0: uploads in pieces, for full-quality photos and video from phones (§11).
 9. Done in 0.6.0: photo places for DMs (§12).
+10. Done in 0.7.0: copies between boxes (§13).
 
 ## 8. Accounts that follow the home's member list (0.2.0)
 
@@ -284,3 +285,46 @@ chat who are on this box. The full contract (DMs `LOCATION-CONTRACT.md`, section
   8 MB kept (the container uses about 24 MiB more than 0.5.0 after start), a few microseconds a lookup. The nearest town within 30 km wins, the bigger one when two are within 1 km of the same distance.
 - **Limits.** 100,000 notes per account, 500 keys per `members`, 100 shas per `get` or `drop`, 200 points per
   `names`, 30 `names` calls a minute per key. Log lines carry counts only.
+
+## 13. Copies between boxes (0.7.0)
+
+A home can have more than one box (DMs `architecture.md`, "More storage boxes later"). The phone uploads once, to the
+first box that takes it; the boxes copy from each other, so every file is on every box and one disk failing loses
+nothing. Set `STORAGE_PEERS` on each box to name the others. The full contract is in the README, "Copies between boxes".
+
+- **Pull, not push.** Each box asks each peer what changed since it last asked, at start and every
+  `STORAGE_PEER_POLL_S` (60) seconds, and fetches the files it lacks with a plain `GET /<sha256>`, streamed to disk and
+  hashed as it arrives (no size limit but the box's own blob cap, and nothing held in memory). Wrong bytes are not kept.
+  A file that can't be fetched is tried again after a minute, then twice as long each time up to six hours, or at once
+  when its peer answers again after being down.
+- **`POST /peer`.** The `/manage` shape, signed NIP-98 with the asking box's service key (§8), answered only for keys
+  in the answering box's own `STORAGE_PEERS`. Every refusal after a good signature is the same 401. The `u` tag must name
+  `/peer` but may be on any address: a box reaches its peer at a tailnet address that is not the peer's public url.
+  Replaying a token within its minute gets the same read-only page.
+- **What a change says.** Per blob: hash, size, type, when it was first stored, when it was erased (or null), and every
+  key's hold: held or let go, when that last changed, when the key first stored it. Owners are keys, not accounts, so
+  each box charges the same accounts it would for an upload, with the same 4 KiB minimum. A copy is never refused for
+  quota: the box it was uploaded to already allowed it. A key with no account here owns its copy uncharged until the
+  account appears (as a home member, by hand), and is charged then.
+- **Agreeing.** Holds and erases (`holds`, `erased`) are what boxes exchange; owners and the bin are what each box makes
+  of them for the files it has. For each key the later change wins, and a let-go wins a tie. An erase is recorded later
+  than every hold it ends, and a hold from before an erase is dead, so a box that was away while a file was erased
+  doesn't bring it back, in either direction. An upload after an erase is a new upload and stays. Taking in a change
+  twice changes nothing, and two boxes that heard the same changes, in any order, hold the same owners, bin and quota
+  totals (a test compares the rows). A change taken in is given a new number on this box too, so a third box hears it,
+  and the box it came from reads it back as nothing new.
+- **Absence is never a delete.** A file missing from a peer, or a peer that is down, changes nothing here. Only a let-go,
+  a removal from the home or an erase that a box recorded moves anything.
+- **Deletes travel.** `DELETE`, a removal from the home, `restore`, `erase` from the CLI or `/manage`, and the bin's own
+  sweep after 30 days all reach the peers as changes. A binned file is copied too (it is still served and can be
+  restored), unless its 30 days are up.
+- **Clocks.** Change times are each box's own clock, so boxes need the right time (Umbrel keeps it). A box whose clock is
+  minutes off decides ties in that window its way; both still end up the same.
+- **Admin page.** `POST /manage` `peers` and `npm run accounts -- peers` show each peer as
+  `xumbrel: 1,204 of 1,204 copied, last 11:40`, with changes still to read and the last error.
+- **Addresses.** Peers are the owner's own setting, so a peer may be on a tailnet or LAN address. `/mirror` keeps its
+  address rules (§2.2) unchanged.
+- **Upgrade.** The 0.7.0 migration writes a hold for every owner and binned blob and a change number for every blob
+  already stored, so a new peer copies everything that is there.
+- **Not copied:** place notes (§12) stay on the box they were sent to; accounts and quotas set by hand (set them on each
+  box, or let the home's member list do it).

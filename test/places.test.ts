@@ -536,7 +536,7 @@ describe('9. a 0.5.0 database', () => {
       const piecesBefore = db.sql.prepare('SELECT * FROM upload_pieces').all();
       db.close();
       db = new Db(file);
-      assert.equal(Number(db.sql.prepare('PRAGMA user_version').get()!.user_version), 8);
+      assert.equal(Number(db.sql.prepare('PRAGMA user_version').get()!.user_version), 9);
       assert.ok(db.sql.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'place_notes'").get());
       assert.ok(db.sql.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'place_notes_account'").get());
       assert.deepEqual(db.sql.prepare('SELECT * FROM blobs').all(), blobsBefore);

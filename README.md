@@ -7,7 +7,7 @@ first.
 
 See [DESIGN.md](DESIGN.md) for why it exists and where it's going (the keeper, key grants, the admin page).
 
-## What works now (0.6.0)
+## What works now (0.7.0)
 
 - **BUD-01** `GET/HEAD /<sha256>[.ext]`: Range requests, CORS, `nosniff` and a sandbox CSP on every blob. Images
   (not SVG), video and audio are served as their type; everything else, SVG included, as
@@ -47,6 +47,8 @@ See [DESIGN.md](DESIGN.md) for why it exists and where it's going (the keeper, k
 - **Photo places** `POST /places` (0.6.0): for DMs, says which people are on this box, keeps the small place notes
   that say where a photo was taken for them, and names the nearest town to a point from a list built into the
   image. Only the box owner, the home's owner and its members may call it. See below.
+- **Copies between boxes** (0.7.0): with `STORAGE_PEERS` set, every file on this box is also kept on the boxes it
+  names, and theirs on this one. Upload to either box; deletes, restores and erases follow. See below.
 
 Not here: BUD-05 media, BUD-07 payments, BUD-08, BUD-09 reports.
 
@@ -78,6 +80,8 @@ STORAGE_PUBLIC_URL=https://storage.example.com STORAGE_OWNER=npub1… npm start
 | `STORAGE_BEHIND_CLOUDFLARE` | `false` | Set to `true` behind a Cloudflare Tunnel, so the per-address limit uses `CF-Connecting-IP`. Leave it off when people can reach the port without Cloudflare, since anyone can send that header |
 | `STORAGE_HOME_URL` | (none) | Your home's https address. When set, its members may upload here |
 | `STORAGE_MEMBER_QUOTA` | `5G` | Quota of each member of the home |
+| `STORAGE_PEERS` | (none) | Other boxes to keep a full copy of, and that keep one of this box: `[name] <url> <npub>`, separated by commas. See "Copies between boxes" |
+| `STORAGE_PEER_POLL_S` | `60` | How often to read the peers' changes and copy what is missing, seconds |
 | `STORAGE_HOME_POLL_S` | `300` | How often to ask the home for its member list |
 | `STORAGE_TOWNS` | `/app/towns/towns.tsv.gz` | The town list `names` answers from (built into the image), or `off` |
 
@@ -491,6 +495,7 @@ CORS is open (`*`), with `Authorization` allowed, and the preflight answers 204.
 | `bin []` | owner, admin | `{items: [{sha256, size, type, charged, binnedAt, erasesAt}], more, parked: [{pubkey, removedAt, reason, bytes, blobs, erasesAt}]}` |
 | `restore [[sha256, ...]]` | owner, admin | `{restored: n}` |
 | `erase [[sha256, ...]]` | owner | `{erased: n}` |
+| `peers []` | owner, admin | `{peers: [{name, url, pubkey, blobs, copied, waiting, behind, lastOk, lastTry, error}]}` |
 
 - `erase` removes any file on this box by its hash, whoever holds it and whether or not it is in the bin, the
   same as the command-line `erase`. A page should only ever send hashes it read from `bin`.
@@ -511,7 +516,52 @@ CORS is open (`*`), with `Authorization` allowed, and the preflight answers 204.
   Purge them from your edge cache too.
 - At most 500 hashes per call. A hash that isn't 64 hex characters makes the whole call an error, and nothing is
   done.
+- `peers`: each peer box (see "Copies between boxes"). `blobs`: how many it has, at the last good read (null before
+  one). `copied`: how many of those are here. `waiting`: files from it still to copy. `behind`: its changes not read
+  yet. `error`: why the last read failed, or null.
 - An unknown method answers `{"error": "unknown method"}`.
+
+## Copies between boxes
+
+Two or more boxes can keep the same files: upload to whichever a phone reaches, and within a minute or so it is on the
+others too. Each box reads what changed on its peers and copies the files it lacks. Deletes, restores from the bin,
+erases and the bin's own 30-day sweep follow. A file missing on one box is never taken as a delete. Why it works this
+way: DESIGN.md §13.
+
+Set it up on each box:
+
+1. Find each box's storage key: `npm run accounts -- home key` (or the `storage key` line the box prints at start).
+2. On each box, set `STORAGE_PEERS` to the other boxes, each as `[name] <url> <npub>`, separated by commas. The url is
+   where this box reaches that one: its public url, or a tailnet or LAN address (`http://100.101.102.103:7480`).
+   The npub is that box's storage key.
+3. Give accounts the same way on every box: the same `STORAGE_HOME_URL` (register every box's key on the home), or the
+   same friends added by hand. A file whose owner has no account on a box is still copied there, and counts against
+   that account once it has one.
+4. Check: `npm run accounts -- peers` prints `xumbrel: 1,204 of 1,204 copied, last 11:40`, or what is wrong.
+
+The first read copies everything the peer has. Copies stream to disk, so big videos are fine; they stop with an error
+in `peers` when this box would have less than 1 GB free. Place notes (`/places`) stay on the box they were sent to.
+
+### `POST /peer`
+
+What a box asks its peers. The same shape as `/manage`, signed NIP-98 (kind 27235) with the asking box's storage key:
+`u` is the url the box asks at, ending in `/peer` (any address: a tailnet address is fine), `method` `POST`, `payload`
+the body's sha256, `created_at` within 60 seconds. Only keys in this box's own `STORAGE_PEERS` get an answer; after a
+good signature every other key gets 401 `{"error": "this key is not a peer of this box"}`. A box with no peers answers
+404.
+
+```
+{"method":"changes","params":[<cursor>, <limit, at most 500>]}
+```
+
+```
+{"result":{"changes":[{"seq","sha256","size","type","created","erased","holds":[{"key","held","at","uploaded"}]}],
+  "next":<cursor for the next call>,"head":<newest change number>,"more":<bool>,"blobs":<blobs on this box>}}
+```
+
+Start at cursor 0. Each blob appears once, at its latest change. `erased` is when it was erased, or null. `holds` is
+every key's latest: `held` true or false (let go), `at` when that changed, `uploaded` when the key first stored it.
+A box takes in, for each key, the later change, a let-go on a tie, and nothing from before an erase.
 
 ## Tests
 

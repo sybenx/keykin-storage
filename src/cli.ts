@@ -6,6 +6,7 @@
 //   node src/cli.ts bin
 //   node src/cli.ts restore <sha256> [<npub|hex> owner, default the account it is charged to, else STORAGE_OWNER]
 //   node src/cli.ts erase <sha256>
+//   node src/cli.ts peers
 //   node src/cli.ts home status | key | sync | apply
 //
 // STORAGE_DIR is the data folder (default ./data). The server can keep running meanwhile. The home commands read
@@ -17,6 +18,7 @@ import { Db } from './db.ts';
 import { describeError, Home, httpHome } from './home.ts';
 import { serviceKey } from './servicekey.ts';
 import { npub, parsePubkey } from './keys.ts';
+import { statusLine, statusOf } from './peers.ts';
 import { removeBlobFile } from './store.ts';
 
 const dir = process.env.STORAGE_DIR || './data';
@@ -126,7 +128,7 @@ try {
     case 'erase': {
       const s = (a ?? '').toLowerCase();
       if (!/^[0-9a-f]{64}$/.test(s)) throw new Error('give a sha256');
-      if (!db.eraseNow(s)) throw new Error('that blob is not here');
+      if (!db.eraseNow(s, now)) throw new Error('that blob is not here');
       removeBlobFile(dir, s);
       console.log('erased. Purge it from your edge cache too (Cloudflare: Caching, Purge by URL).');
       break;
@@ -144,8 +146,14 @@ try {
       console.log(`restored to ${npub(owner)}`);
       break;
     }
+    case 'peers': {
+      const all = statusOf(db);
+      if (all.length === 0) console.log('no peers: set STORAGE_PEERS to keep a copy of everything on another box');
+      for (const s of all) console.log(statusLine(s));
+      break;
+    }
     default:
-      console.log('commands: accounts | add <npub> <quota> | remove <npub> [--purge] | bin | restore <sha256> [<npub>] | erase <sha256> | home status|key|sync|apply');
+      console.log('commands: accounts | add <npub> <quota> | remove <npub> [--purge] | bin | restore <sha256> [<npub>] | erase <sha256> | peers | home status|key|sync|apply');
   }
 } catch (err) {
   console.error((err as Error).message);

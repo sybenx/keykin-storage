@@ -1,6 +1,7 @@
 // Settings, from the environment (main.ts) or given directly (tests).
 
 import { parsePubkey } from './keys.ts';
+import type { PeerConfig } from './peers.ts';
 
 export interface Config {
   /** Where the database and blobs live. */
@@ -70,6 +71,12 @@ export interface Config {
   towns?: string;
   /** Tests only: most place notes one account may keep (default 100,000). */
   maxPlaceNotes?: number;
+  /** Other boxes this one keeps a full copy of, and that keep one of it (peers.ts). */
+  peers?: PeerConfig[];
+  /** How often to read the peers' changes and copy what is missing, seconds (default 60). */
+  peerPollS?: number;
+  /** Tests only: how long a peer request may sit with nothing arriving, ms (default 60 s). */
+  peerIdleMs?: number;
 }
 
 /** Where the image keeps its town list. */
@@ -153,6 +160,33 @@ function towns(env: NodeJS.ProcessEnv): string {
 }
 
 /**
+ * STORAGE_PEERS: peer boxes, separated by commas or new lines, each `[name] <url> <npub or hex pubkey>`, for example
+ * `xumbrel http://100.101.102.103:7480 npub1…`. The url is where this box reaches the peer: http or https, with no
+ * credentials, query or #. The pubkey is the peer's storage key (its `home key`). The name defaults to the url's host.
+ */
+export function parsePeers(raw: string): PeerConfig[] {
+  const out: PeerConfig[] = [];
+  for (const entry of raw.split(/[,\n]/).map((e) => e.trim()).filter(Boolean)) {
+    const parts = entry.split(/\s+/);
+    if (parts.length < 2 || parts.length > 3) throw new Error(`STORAGE_PEERS: give each peer as "[name] <url> <npub>", not "${entry}"`);
+    const [name, url, key] = parts.length === 3 ? parts : [null, parts[0], parts[1]];
+    let u: URL;
+    try {
+      u = new URL(url!);
+    } catch {
+      throw new Error(`STORAGE_PEERS: "${url}" is not a url`);
+    }
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error(`STORAGE_PEERS: "${url}" must be http or https`);
+    if (u.username || u.password || u.search || u.hash) throw new Error(`STORAGE_PEERS: "${url}" must have no credentials, query or #`);
+    const pubkey = parsePubkey(key!);
+    if (!pubkey) throw new Error(`STORAGE_PEERS: "${key}" is not an npub or a hex pubkey`);
+    if (out.some((p) => p.pubkey === pubkey)) throw new Error('STORAGE_PEERS: a peer is listed twice');
+    out.push({ name: name ?? u.host, url: url!.replace(/\/+$/, ''), pubkey });
+  }
+  return out;
+}
+
+/**
  * Reads the settings. A box installed before it's set up (no STORAGE_PUBLIC_URL or STORAGE_OWNER) still starts:
  * it serves reads and refuses every write with 503 until both are set. Malformed values are errors that name
  * the setting, and the server does not start.
@@ -189,5 +223,7 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): Config {
     keeperPollS: number(env, 'STORAGE_KEEPER_POLL_S', 60),
     keeper: (env.STORAGE_KEEPER ?? 'on').trim().toLowerCase() !== 'off',
     towns: towns(env),
+    peers: parsePeers(env.STORAGE_PEERS ?? ''),
+    peerPollS: number(env, 'STORAGE_PEER_POLL_S', 60),
   };
 }

@@ -9,6 +9,7 @@ import { checkHttpAuth, HTTP_AUTH_KIND, parseAuth } from './auth.ts';
 import type { Config } from './config.ts';
 import type { Db } from './db.ts';
 import type { Home } from './home.ts';
+import type { PeerStatus } from './peers.ts';
 import type { ServiceKey } from './servicekey.ts';
 
 export const MANAGE_PATH = '/manage';
@@ -36,6 +37,7 @@ const METHODS: Record<string, Role[]> = {
   bin: ['owner', 'admin'],
   restore: ['owner', 'admin'],
   erase: ['owner'],
+  peers: ['owner', 'admin'],
 };
 
 export interface ManageOptions {
@@ -49,6 +51,8 @@ export interface ManageOptions {
   now: () => number;
   /** Deletes an erased blob's file (after its row is gone). */
   removeFile: (sha256: string) => void;
+  /** How each peer box is doing (peers.ts). */
+  peers?: () => PeerStatus[];
 }
 
 /** A refusal with its HTTP status; the reason goes back as `{"error": reason}`. */
@@ -152,6 +156,8 @@ export function manager(o: ManageOptions) {
         return { result: usage() };
       case 'bin':
         return { result: bin() };
+      case 'peers':
+        return { result: { peers: o.peers?.() ?? [] } };
       case 'restore': {
         const shas = hashes(params);
         if (typeof shas === 'string') return { error: shas };
@@ -162,7 +168,7 @@ export function manager(o: ManageOptions) {
       case 'erase': {
         const shas = hashes(params);
         if (typeof shas === 'string') return { error: shas };
-        const erased = db.tx(() => shas.filter((s) => db.eraseNow(s)));
+        const erased = db.tx(() => shas.filter((s) => db.eraseNow(s, o.now())));
         for (const s of erased) o.removeFile(s);
         return { result: { erased: erased.length } };
       }

@@ -183,7 +183,79 @@ const MIGRATIONS: ((db: Db) => void)[] = [
       sha TEXT PRIMARY KEY, account TEXT NOT NULL REFERENCES accounts(pubkey) ON DELETE CASCADE,
       bytes BLOB NOT NULL, created INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS place_notes_account ON place_notes(account, created);`),
+  // 0.7.0: copies between boxes (peers.ts). Every key's hold on a blob with when it last changed, erases, and a
+  // change number per blob that peers read from. Filled from what is stored now.
+  (db) => db.sql.exec(`
+    CREATE TABLE IF NOT EXISTS holds (
+      sha256 TEXT NOT NULL, key TEXT NOT NULL, held INTEGER NOT NULL, at INTEGER NOT NULL, uploaded INTEGER NOT NULL,
+      PRIMARY KEY (sha256, key));
+    CREATE TABLE IF NOT EXISTS erased (sha256 TEXT PRIMARY KEY, at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS changes (
+      sha256 TEXT PRIMARY KEY, seq INTEGER NOT NULL, size INTEGER NOT NULL, type TEXT NOT NULL, created INTEGER NOT NULL);
+    CREATE UNIQUE INDEX IF NOT EXISTS changes_seq ON changes(seq);
+    CREATE TABLE IF NOT EXISTS peers (
+      pubkey TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, cursor INTEGER NOT NULL DEFAULT 0, head INTEGER,
+      blobs INTEGER, last_ok INTEGER, last_try INTEGER, error TEXT);
+    CREATE TABLE IF NOT EXISTS peer_wants (
+      sha256 TEXT PRIMARY KEY, peer TEXT NOT NULL, size INTEGER NOT NULL, tries INTEGER NOT NULL DEFAULT 0,
+      next_try INTEGER NOT NULL DEFAULT 0, error TEXT);
+    CREATE INDEX IF NOT EXISTS peer_wants_peer ON peer_wants(peer);
+    INSERT OR IGNORE INTO holds (sha256, key, held, at, uploaded) SELECT sha256, key, 1, uploaded, uploaded FROM owners;
+    INSERT OR IGNORE INTO holds (sha256, key, held, at, uploaded)
+      SELECT sha256, COALESCE(binned_by, '${NOBODY}'), 0, binned, created FROM blobs
+      WHERE binned IS NOT NULL AND sha256 NOT IN (SELECT sha256 FROM owners);
+    INSERT INTO changes (sha256, seq, size, type, created)
+      SELECT sha256, (SELECT COALESCE(MAX(seq), 0) FROM changes) + ROW_NUMBER() OVER (ORDER BY created, sha256), size, type, created
+      FROM blobs WHERE sha256 NOT IN (SELECT sha256 FROM changes);`),
 ];
+
+/** The key a binned blob's hold is on when the account that let go of it is unknown (only from the 0.7.0 upgrade). */
+const NOBODY = '0'.repeat(64);
+
+/** One key's hold on a blob, as peers exchange it: held or let go, and when that last changed. */
+export interface Hold {
+  key: string;
+  held: boolean;
+  /** When this key last took or let go of the blob (Unix seconds). The later change wins. */
+  at: number;
+  /** When it first took its copy (what /list shows). */
+  uploaded: number;
+}
+
+/** What one box tells its peers about one blob. */
+export interface Change {
+  sha256: string;
+  size: number;
+  type: string;
+  created: number;
+  /** When it was erased, or null. Holds from before then are dead. */
+  erased: number | null;
+  holds: Hold[];
+}
+
+/** A peer box, with how far this box has read its changes. */
+export interface PeerRow {
+  pubkey: string;
+  name: string;
+  url: string;
+  cursor: number;
+  /** Its newest change number and how many blobs it has, at the last good read. */
+  head: number | null;
+  blobs: number | null;
+  lastOk: number | null;
+  lastTry: number | null;
+  error: string | null;
+}
+
+/** A file this box knows it should have and has not copied yet. */
+export interface Want {
+  sha256: string;
+  peer: string;
+  size: number;
+  tries: number;
+  nextTry: number;
+  error: string | null;
+}
 
 export interface Owned extends Blob {
   uploaded: number;
@@ -296,7 +368,7 @@ export class Db {
         for (const s of shas) this.letGo(s, k, now);
       }
       const erased = this.sql.prepare('SELECT sha256 FROM blobs WHERE binned IS NOT NULL AND binned_by = ?').all(pubkey).map((r) => r.sha256 as string);
-      for (const s of erased) this.eraseRow(s);
+      for (const s of erased) this.eraseRow(s, now);
       this.sql.prepare('DELETE FROM accounts WHERE pubkey = ?').run(pubkey);
       return erased;
     });
@@ -342,7 +414,7 @@ export class Db {
       const parked = this.sql.prepare('SELECT p.sha256, p.key, p.uploaded, b.size, b.type FROM parked p JOIN blobs b ON b.sha256 = p.sha256 WHERE p.account = ?').all(pubkey);
       for (const p of parked) {
         // only keys that still write for this account take their copies back
-        if (this.accountKey(p.key as string) === pubkey) this.ownIn(p.sha256 as string, Number(p.size), p.type as string, p.key as string, Number(p.uploaded));
+        if (this.accountKey(p.key as string) === pubkey) this.ownIn(p.sha256 as string, Number(p.size), p.type as string, p.key as string, Number(p.uploaded), now);
       }
       this.sql.prepare('DELETE FROM parked WHERE account = ?').run(pubkey);
       this.sql.prepare('DELETE FROM home_removed WHERE pubkey = ?').run(pubkey);
@@ -509,7 +581,7 @@ export class Db {
 
   /** Records that `key` holds the blob. Takes it out of the bin if it was there. Returns whether the blob is new. */
   own(sha256: string, size: number, type: string, key: string, now: number): boolean {
-    return this.tx(() => this.ownIn(sha256, size, type, key, now));
+    return this.tx(() => this.ownIn(sha256, size, type, key, now, now));
   }
 
   /**
@@ -525,11 +597,13 @@ export class Db {
       const why = this.refusal(account, sha256, size, pending(account));
       if (why) return { ok: false, status: 413, reason: why };
       place();
-      return { ok: true, isNew: this.ownIn(sha256, size, type, key, now) };
+      return { ok: true, isNew: this.ownIn(sha256, size, type, key, now, now) };
     });
   }
 
-  private ownIn(sha256: string, size: number, type: string, key: string, now: number): boolean {
+  /** `key` takes a copy, first `uploaded` (kept if it had one), as of `at` (what peers compare). */
+  private ownIn(sha256: string, size: number, type: string, key: string, uploaded: number, at: number): boolean {
+    const now = uploaded;
     const had = this.blob(sha256);
     const account = this.accountKey(key);
     const was = account !== null && this.charged(account, sha256);
@@ -541,6 +615,10 @@ export class Db {
     if (account !== null && !was) this.charge(account, bytes, 1);
     // out of the bin: off the quota of whoever let go of it last, unless that's this account
     if (binnedBy !== null && binnedBy !== account) this.charge(binnedBy, bytes, -1);
+    const row = this.blob(sha256)!;
+    this.note(sha256, key, true, at, this.uploadedAt(sha256, key) ?? now, row);
+    // a copy a peer told of before the file was here: its other holders own it too
+    if (!had) this.materialize(sha256);
     return !had;
   }
 
@@ -552,9 +630,15 @@ export class Db {
   private letGo(sha256: string, key: string, now: number): boolean {
     const account = this.accountKey(key);
     const was = account !== null && this.charged(account, sha256);
+    const uploaded = this.uploadedAt(sha256, key);
     const gone = this.sql.prepare('DELETE FROM owners WHERE sha256 = ? AND key = ?').run(sha256, key).changes > 0;
-    if (gone && !this.sql.prepare('SELECT 1 FROM owners WHERE sha256 = ?').get(sha256)) {
-      this.sql.prepare('UPDATE blobs SET binned = ?, binned_by = ? WHERE sha256 = ?').run(now, account, sha256);
+    if (gone) {
+      // the hold's change time never goes back (peers compare it); the bin clock is the time asked for, which for a
+      // member removed before the box heard of it may be a little earlier
+      this.note(sha256, key, false, now, uploaded ?? now, this.blob(sha256)!);
+      if (!this.sql.prepare('SELECT 1 FROM owners WHERE sha256 = ?').get(sha256)) {
+        this.sql.prepare('UPDATE blobs SET binned = ?, binned_by = ? WHERE sha256 = ?').run(now, account, sha256);
+      }
     }
     if (gone && was && !this.charged(account!, sha256)) this.charge(account!, this.blob(sha256)!.size, -1);
     return gone;
@@ -744,7 +828,7 @@ export class Db {
       const by = this.binnedBy(sha256);
       const key = to.key ?? (by !== null && this.account(by) ? by : to.fallback);
       if (!key) throw new Error('the account it is charged to is gone: give the owner to restore it to (or set STORAGE_OWNER)');
-      this.ownIn(b.sha256, b.size, b.type, key, now);
+      this.ownIn(b.sha256, b.size, b.type, key, now, now);
       return key;
     });
   }
@@ -757,14 +841,23 @@ export class Db {
   /**
    * Erases a blob's row now, whoever owns it (a take-down). Returns whether there was one. Delete the file after.
    */
-  eraseNow(sha256: string): boolean {
-    return this.tx(() => this.eraseRow(sha256));
+  eraseNow(sha256: string, now = Math.floor(Date.now() / 1000)): boolean {
+    return this.tx(() => this.eraseRow(sha256, now));
   }
 
-  /** Deletes a blob's row and takes it off every account it was charged to. */
-  private eraseRow(sha256: string): boolean {
+  /**
+   * Deletes a blob's row and takes it off every account it was charged to. Records the erase for peers, later than
+   * every hold on it, so no copy elsewhere brings it back.
+   */
+  private eraseRow(sha256: string, now: number): boolean {
     const b = this.blob(sha256);
     if (!b) return false;
+    const last = Number(this.sql.prepare('SELECT COALESCE(MAX(at), 0) AS at FROM holds WHERE sha256 = ?').get(sha256)!.at);
+    const at = Math.max(now, last, this.erasedAt(sha256) ?? 0);
+    this.sql.prepare('INSERT INTO erased (sha256, at) VALUES (?, ?) ON CONFLICT(sha256) DO UPDATE SET at = excluded.at').run(sha256, at);
+    this.sql.prepare('DELETE FROM holds WHERE sha256 = ?').run(sha256);
+    this.sql.prepare('DELETE FROM peer_wants WHERE sha256 = ?').run(sha256);
+    this.bump(sha256, b);
     const charged = new Set(this.sql.prepare('SELECT DISTINCT k.account FROM owners o JOIN keys k ON k.key = o.key WHERE o.sha256 = ?')
       .all(sha256).map((r) => r.account as string));
     const by = b.binned !== null ? this.binnedBy(sha256) : null;
@@ -775,11 +868,226 @@ export class Db {
   }
 
   /** Erases a blob's row if it is still binned since before `before`. Returns whether it did. */
-  erase(sha256: string, before: number): boolean {
+  erase(sha256: string, before: number, now = Math.floor(Date.now() / 1000)): boolean {
     return this.tx(() => {
       const b = this.blob(sha256);
       if (!b || b.binned === null || b.binned >= before) return false;
-      return this.eraseRow(sha256);
+      return this.eraseRow(sha256, now);
     });
+  }
+
+  // --- copies between boxes (peers.ts). `holds` and `erased` are what boxes agree on; `owners` and the bin are what
+  // this box makes of them for the files it has. For each key the later change wins, a let-go wins a tie, and an
+  // erase kills every hold from before it. So two boxes that heard the same changes, in any order, any number of
+  // times, end up the same.
+
+  /** When the blob was erased here, or null. */
+  erasedAt(sha256: string): number | null {
+    const r = this.sql.prepare('SELECT at FROM erased WHERE sha256 = ?').get(sha256);
+    return r ? Number(r.at) : null;
+  }
+
+  private holdOf(sha256: string, key: string): Hold | null {
+    const r = this.sql.prepare('SELECT key, held, at, uploaded FROM holds WHERE sha256 = ? AND key = ?').get(sha256, key);
+    return r ? { key: r.key as string, held: !!r.held, at: Number(r.at), uploaded: Number(r.uploaded) } : null;
+  }
+
+  /** Every hold known on a blob. */
+  holdsOn(sha256: string): Hold[] {
+    return this.sql.prepare('SELECT key, held, at, uploaded FROM holds WHERE sha256 = ? ORDER BY key').all(sha256)
+      .map((r) => ({ key: r.key as string, held: !!r.held, at: Number(r.at), uploaded: Number(r.uploaded) }));
+  }
+
+  /** Gives the blob a new change number, so peers read it again. Size, type and created stay as first heard. */
+  private bump(sha256: string, b: { size: number; type: string; created: number }): void {
+    this.sql.prepare(`INSERT INTO changes (sha256, seq, size, type, created) VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM changes), ?, ?, ?)
+      ON CONFLICT(sha256) DO UPDATE SET seq = excluded.seq`).run(sha256, b.size, b.type, b.created);
+  }
+
+  /**
+   * Records a change made on this box to `key`'s hold. Its time is `at`, moved later where needed so it beats what
+   * it replaces here: after the erase, never before the hold's last change. Returns the time used.
+   */
+  private note(sha256: string, key: string, held: boolean, at: number, uploaded: number, b: { size: number; type: string; created: number }): number {
+    const prev = this.holdOf(sha256, key);
+    const e = this.erasedAt(sha256);
+    let t = e === null ? at : Math.max(at, e + 1);
+    // a let-go wins a tie, so only taking a copy back needs to be strictly later
+    if (prev) t = Math.max(t, !prev.held && held ? prev.at + 1 : prev.at);
+    this.sql.prepare(`INSERT INTO holds (sha256, key, held, at, uploaded) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(sha256, key) DO UPDATE SET held = excluded.held, at = excluded.at, uploaded = excluded.uploaded`)
+      .run(sha256, key, held ? 1 : 0, t, held && prev?.held ? prev.uploaded : uploaded);
+    this.bump(sha256, b);
+    return t;
+  }
+
+  /** The accounts a blob is charged to here: those whose keys own it, and the one it is binned on. */
+  private chargedTo(sha256: string): Set<string> {
+    const s = new Set(this.sql.prepare('SELECT DISTINCT k.account FROM owners o JOIN keys k ON k.key = o.key WHERE o.sha256 = ?')
+      .all(sha256).map((r) => r.account as string));
+    const b = this.sql.prepare('SELECT binned, binned_by FROM blobs WHERE sha256 = ?').get(sha256);
+    if (b && b.binned !== null && b.binned_by !== null) s.add(b.binned_by as string);
+    return s;
+  }
+
+  /**
+   * Makes the blob's row agree with its holds: owners are the live held keys; with none, it is in the bin from the
+   * last let-go, on that key's account; with no live hold after an erase, the row goes (delete the file). Quotas
+   * move with it. 'absent' when there is no row (the file is not here).
+   */
+  private materialize(sha256: string): 'kept' | 'erased' | 'absent' {
+    const b = this.blob(sha256);
+    if (!b) return 'absent';
+    const e = this.erasedAt(sha256);
+    const live = this.holdsOn(sha256).filter((h) => e === null || h.at > e);
+    const before = this.chargedTo(sha256);
+    if (live.length === 0) {
+      if (e === null) return 'kept';
+      this.sql.prepare('DELETE FROM blobs WHERE sha256 = ?').run(sha256);
+      for (const a of before) this.charge(a, b.size, -1);
+      return 'erased';
+    }
+    const held = live.filter((h) => h.held);
+    const keep = new Set(held.map((h) => h.key));
+    for (const o of this.sql.prepare('SELECT key FROM owners WHERE sha256 = ?').all(sha256)) {
+      if (!keep.has(o.key as string)) this.sql.prepare('DELETE FROM owners WHERE sha256 = ? AND key = ?').run(sha256, o.key);
+    }
+    for (const h of held) this.sql.prepare('INSERT OR IGNORE INTO owners (sha256, key, uploaded) VALUES (?, ?, ?)').run(sha256, h.key, h.uploaded);
+    if (held.length > 0) {
+      this.sql.prepare('UPDATE blobs SET binned = NULL, binned_by = NULL WHERE sha256 = ?').run(sha256);
+    } else {
+      const last = live.reduce((x, y) => (y.at > x.at || (y.at === x.at && y.key > x.key) ? y : x));
+      this.sql.prepare('UPDATE blobs SET binned = ?, binned_by = ? WHERE sha256 = ?').run(last.at, this.accountKey(last.key), sha256);
+    }
+    const after = this.chargedTo(sha256);
+    for (const a of before) if (!after.has(a)) this.charge(a, b.size, -1);
+    for (const a of after) if (!before.has(a)) this.charge(a, b.size, 1);
+    return 'kept';
+  }
+
+  /** Changes after `cursor`, oldest first, at most `limit`, and the newest change number. */
+  changesSince(cursor: number, limit: number): { changes: (Change & { seq: number })[]; head: number } {
+    const rows = this.sql.prepare('SELECT sha256, seq, size, type, created FROM changes WHERE seq > ? ORDER BY seq LIMIT ?').all(cursor, limit);
+    const head = Number(this.sql.prepare('SELECT COALESCE(MAX(seq), 0) AS head FROM changes').get()!.head);
+    return {
+      head,
+      changes: rows.map((r) => ({
+        seq: Number(r.seq), sha256: r.sha256 as string, size: Number(r.size), type: r.type as string, created: Number(r.created),
+        erased: this.erasedAt(r.sha256 as string), holds: this.holdsOn(r.sha256 as string),
+      })),
+    };
+  }
+
+  /**
+   * Takes in what a peer says about a blob. Hearing the same thing twice changes nothing. Returns 'erase' when the
+   * file here must go, 'want' when this box should copy the file (it is now on the list of wants), else 'none'.
+   * A binned blob whose time in the bin is up (before `binBefore`) is not wanted.
+   */
+  applyPeer(c: Change, peer: string, binBefore: number): 'erase' | 'want' | 'none' {
+    return this.tx(() => {
+      let changed = false;
+      const e0 = this.erasedAt(c.sha256);
+      if (c.erased !== null && (e0 === null || c.erased > e0)) {
+        this.sql.prepare('INSERT INTO erased (sha256, at) VALUES (?, ?) ON CONFLICT(sha256) DO UPDATE SET at = excluded.at').run(c.sha256, c.erased);
+        changed = true;
+      }
+      const e = this.erasedAt(c.sha256);
+      for (const h of c.holds) {
+        if (e !== null && h.at <= e) continue;
+        const prev = this.holdOf(c.sha256, h.key);
+        if (!prev || h.at > prev.at || (h.at === prev.at && !h.held && prev.held)) {
+          this.sql.prepare(`INSERT INTO holds (sha256, key, held, at, uploaded) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(sha256, key) DO UPDATE SET held = excluded.held, at = excluded.at, uploaded = excluded.uploaded`)
+            .run(c.sha256, h.key, h.held ? 1 : 0, h.at, h.uploaded);
+          changed = true;
+        }
+      }
+      if (e !== null) this.sql.prepare('DELETE FROM holds WHERE sha256 = ? AND at <= ?').run(c.sha256, e);
+      if (!changed) return 'none';
+      this.bump(c.sha256, c);
+      const r = this.materialize(c.sha256);
+      if (r === 'erased') {
+        this.sql.prepare('DELETE FROM peer_wants WHERE sha256 = ?').run(c.sha256);
+        return 'erase';
+      }
+      if (r === 'kept') return 'none';
+      const live = this.holdsOn(c.sha256);
+      const wanted = live.some((h) => h.held) || (live.length > 0 && Math.max(...live.map((h) => h.at)) >= binBefore);
+      if (!wanted) {
+        this.sql.prepare('DELETE FROM peer_wants WHERE sha256 = ?').run(c.sha256);
+        return 'none';
+      }
+      this.sql.prepare('INSERT OR IGNORE INTO peer_wants (sha256, peer, size) VALUES (?, ?, ?)').run(c.sha256, peer, c.size);
+      return 'want';
+    });
+  }
+
+  /** Files to copy whose next try is due, oldest try first. */
+  wants(now: number, limit: number): Want[] {
+    return this.sql.prepare(`SELECT sha256, peer, size, tries, next_try AS nextTry, error FROM peer_wants WHERE next_try <= ?
+      ORDER BY next_try, sha256 LIMIT ?`).all(now, limit) as unknown as Want[];
+  }
+
+  /** How many files this box still has to copy, in all or first heard of from `peer`. */
+  wantCount(peer?: string): number {
+    const r = peer === undefined ? this.sql.prepare('SELECT COUNT(*) AS n FROM peer_wants').get()
+      : this.sql.prepare('SELECT COUNT(*) AS n FROM peer_wants WHERE peer = ?').get(peer);
+    return Number(r!.n);
+  }
+
+  /** Copies first heard of from `peer` are due now (it is back after being unreachable). */
+  retryWants(peer: string): void {
+    this.sql.prepare('UPDATE peer_wants SET next_try = 0 WHERE peer = ?').run(peer);
+  }
+
+  /** A copy that failed: tried again at `next`. */
+  wantFailed(sha256: string, next: number, error: string): void {
+    this.sql.prepare('UPDATE peer_wants SET tries = tries + 1, next_try = ?, error = ? WHERE sha256 = ?').run(next, error, sha256);
+  }
+
+  /**
+   * Keeps a copied file: in one transaction, `place` moves it into place, then the row is made from the holds. If the
+   * blob is here already (uploaded meanwhile) or no longer wanted (erased meanwhile), `place` is not called. Returns
+   * whether it was placed.
+   */
+  placeCopy(sha256: string, place: () => void): boolean {
+    return this.tx(() => {
+      const c = this.sql.prepare('SELECT size, type, created FROM changes WHERE sha256 = ?').get(sha256);
+      const e = this.erasedAt(sha256);
+      const live = this.holdsOn(sha256).filter((h) => e === null || h.at > e);
+      this.sql.prepare('DELETE FROM peer_wants WHERE sha256 = ?').run(sha256);
+      if (!c || this.blob(sha256) || live.length === 0) return false;
+      place();
+      this.sql.prepare('INSERT INTO blobs (sha256, size, type, created, binned) VALUES (?, ?, ?, ?, NULL)').run(sha256, c.size, c.type, c.created);
+      this.materialize(sha256);
+      return true;
+    });
+  }
+
+  /** Sets the peer list: new peers start from the beginning, known ones keep their place, others are forgotten. */
+  setPeers(peers: { pubkey: string; name: string; url: string }[]): void {
+    this.tx(() => {
+      const keep = new Set(peers.map((p) => p.pubkey));
+      for (const r of this.sql.prepare('SELECT pubkey FROM peers').all()) {
+        if (!keep.has(r.pubkey as string)) this.sql.prepare('DELETE FROM peers WHERE pubkey = ?').run(r.pubkey);
+      }
+      for (const p of peers) {
+        this.sql.prepare(`INSERT INTO peers (pubkey, name, url) VALUES (?, ?, ?)
+          ON CONFLICT(pubkey) DO UPDATE SET name = excluded.name, url = excluded.url`).run(p.pubkey, p.name, p.url);
+      }
+    });
+  }
+
+  peerRows(): PeerRow[] {
+    return this.sql.prepare(`SELECT pubkey, name, url, cursor, head, blobs, last_ok AS lastOk, last_try AS lastTry, error FROM peers
+      ORDER BY name`).all() as unknown as PeerRow[];
+  }
+
+  savePeer(pubkey: string, s: Partial<Omit<PeerRow, 'pubkey' | 'name' | 'url'>>): void {
+    const cols: Record<string, string> = { cursor: 'cursor', head: 'head', blobs: 'blobs', lastOk: 'last_ok', lastTry: 'last_try', error: 'error' };
+    const keys = Object.keys(s).filter((k) => cols[k]);
+    if (keys.length === 0) return;
+    this.sql.prepare(`UPDATE peers SET ${keys.map((k) => `${cols[k]} = ?`).join(', ')} WHERE pubkey = ?`)
+      .run(...keys.map((k) => (s as any)[k] ?? null), pubkey);
   }
 }

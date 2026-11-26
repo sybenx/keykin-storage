@@ -16,6 +16,7 @@ import { httpRpc, Keeper, wsUrlOf, type HomeRpc } from './keeper.ts';
 import { clientAddress, RateLimit } from './limit.ts';
 import { isManagePath, manager, send } from './manage.ts';
 import { guardedFetch, MirrorError } from './mirror.ts';
+import { isPeerPath, peerHandler, Peers } from './peers.ts';
 import { isPlacesPath, placesHandler } from './places.ts';
 import { serviceKey, type ServiceKey } from './servicekey.ts';
 import { Aborted, Store, TooLarge, TooSlow, type MinRate, type Received } from './store.ts';
@@ -79,6 +80,8 @@ export interface Running {
   keeper: Keeper | null;
   /** The town list behind `names` (towns.ts), or null when STORAGE_TOWNS is off. It loads after the server listens. */
   towns: Towns | null;
+  /** Copies to and from peer boxes (peers.ts), or null with no STORAGE_PEERS. */
+  peers: Peers | null;
   close(): Promise<void>;
 }
 
@@ -86,6 +89,8 @@ export async function start(config: Config, opts: {
   homeSource?: HomeSource; homeRpc?: HomeRpc; noKeeperStart?: boolean;
   /** Tests only: this town list instead of the one STORAGE_TOWNS names; it is not loaded here. */
   towns?: Towns | null;
+  /** Tests only: don't copy from peers on a timer (call `peers.sync()`). */
+  noPeerStart?: boolean;
 } = {}): Promise<Running> {
   const now = config.now ?? (() => Math.floor(Date.now() / 1000));
   /** Largest body of one request (PUT /upload, /mirror); bigger files come in pieces. */
@@ -160,7 +165,7 @@ export async function start(config: Config, opts: {
     let n = 0;
     for (const sha of db.expired(before)) {
       // row and file go in one synchronous step, so an upload can't slip between them
-      if (db.erase(sha, before)) {
+      if (db.erase(sha, before, now())) {
         store.remove(sha);
         n++;
       }
@@ -239,7 +244,7 @@ export async function start(config: Config, opts: {
   };
 
   const limit = new RateLimit({ burst: config.authBurst ?? 60, perSecond: config.authPerSecond ?? 10 });
-  const manage = manager({ config, db, home, key, ready, now, removeFile: (s) => store.remove(s) });
+  const manage = manager({ config, db, home, key, ready, now, removeFile: (s) => store.remove(s), peers: () => peers?.status() ?? [] });
   const townsFile = config.towns ?? 'off';
   const towns = opts.towns !== undefined ? opts.towns : townsFile === 'off' ? null : new Towns(townsFile, log);
   const room = (n: number) => {
@@ -251,6 +256,19 @@ export async function start(config: Config, opts: {
     }
   };
   const places = placesHandler({ config, db, home, key, ready, now, towns, room, log });
+  const peerList = (config.peers ?? []).filter((p) => {
+    if (p.pubkey !== key.pk) return true;
+    log(`peer ${p.name} is this box itself (its key is this box's): left out`);
+    return false;
+  });
+  const peerAnswers = peerHandler({ db, peers: () => peerList, now });
+  const peers = peerList.length > 0
+    ? new Peers({
+      db, store, key, peers: peerList, now, log, pollS: config.peerPollS ?? 60, binDays: config.binDays, maxBlobBytes: config.maxBlobBytes,
+      room, idleMs: config.peerIdleMs,
+    })
+    : null;
+  if (!peers) db.setPeers([]);
 
   const timer = setInterval(sweep, 3600_000);
   timer.unref();
@@ -270,11 +288,12 @@ export async function start(config: Config, opts: {
     if (method === 'OPTIONS') return end(res, 204);
     if (req.headers.authorization !== undefined && !limit.take(clientAddress(req, config.behindCloudflare))) {
       const why = 'too many signed requests from your address; wait a few seconds';
-      if (isManagePath(path) || isPlacesPath(path)) return send(res, 429, { error: why }, method === 'HEAD');
+      if (isManagePath(path) || isPlacesPath(path) || isPeerPath(path)) return send(res, 429, { error: why }, method === 'HEAD');
       return fail(res, 429, why, method === 'HEAD');
     }
     if (isManagePath(path)) return manage.handle(req, res, path); // answers `info` even before the box is set up
     if (isPlacesPath(path)) return places.handle(req, res); // answers 503 itself before the box is set up
+    if (isPeerPath(path)) return peerAnswers.handle(req, res); // answers 404 itself with no peers
     if (!ready && method !== 'GET' && method !== 'HEAD') {
       return fail(res, 503, 'this box is not set up yet: set STORAGE_PUBLIC_URL and STORAGE_OWNER');
     }
@@ -771,6 +790,7 @@ export async function start(config: Config, opts: {
   await new Promise<void>((resolve) => server.listen(config.port, config.host, resolve));
   home?.start();
   if (!opts.noKeeperStart) keeper?.start();
+  if (!opts.noPeerStart) peers?.start();
   if (opts.towns === undefined) void towns?.load(); // after listening: `names` says "still loading" until it is in
   let closed: Promise<void> | null = null;
   const addr = server.address();
@@ -786,11 +806,13 @@ export async function start(config: Config, opts: {
     home,
     keeper,
     towns,
+    peers,
     close: async () => {
       // safe to call twice: the second call waits for the first
       closed ??= (async () => {
         await home?.stop();
         await keeper?.stop();
+        await peers?.stop();
         closing.abort();
         clearInterval(uploadTimer);
         await new Promise<void>((resolve) => {
